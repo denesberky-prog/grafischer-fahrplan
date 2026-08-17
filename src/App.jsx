@@ -2114,8 +2114,8 @@ export default function GraphicalTimetable() {
                             style={{ accentColor: k.color }}
                           />
                           <span style={{ ...styles.legendSwatch, background: k.color }} />
-                          <span className="mono" style={{ fontSize: 12.5 }}>
-                            {t("kursPrefix")} {k.name}
+                          <span className="mono" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>
+                            {k.name}
                             {Number(k.interval) > 0 ? ` · ${k.interval}${t("intervalSuffix")}` : ""}
                             {k.endTime ? ` · ${t("untilSuffix")} ${k.endTime}` : ""}
                           </span>
@@ -3532,8 +3532,9 @@ const styles = {
     border: "1px solid #D7DBD5",
     borderRadius: 6,
     boxShadow: "0 4px 16px rgba(27,36,48,0.18)",
-    minWidth: 260,
-    maxWidth: 380,
+    width: "max-content",
+    minWidth: 220,
+    maxWidth: "min(560px, 90vw)",
     maxHeight: 320,
     overflowY: "auto",
   },
