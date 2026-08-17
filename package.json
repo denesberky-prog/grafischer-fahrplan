@@ -1,0 +1,15 @@
+{
+  "name": "grafischer-fahrplan",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone graphical-timetable editor. Edit src/App.jsx, then `npm install && npm run build` to regenerate ../grafischer-fahrplan.html.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  }
+}
