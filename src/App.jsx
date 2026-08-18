@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.3.1";
+const APP_VERSION = "1.4.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -275,10 +275,7 @@ const TRANSLATIONS = {
     defaultStationName: "Neue Station",
     defaultSignalName: "Neues Signal",
     tabExport: "Tabellenfahrplan",
-    exportFrom: "Von Station",
-    exportTo: "bis Station",
-    exportNoRange: "Bitte Start- und Zielstation wählen.",
-    exportSameStation: "Start- und Zielstation dürfen nicht gleich sein.",
+    exportNoRange: "Mindestens eine Linie aktivieren und Start-/Zielstation wählen.",
     exportWindowFrom: "Zeitraum von",
     exportWindowTo: "bis",
     exportStationsTitle: "Abfahrtszeit anzeigen:",
@@ -452,10 +449,7 @@ const TRANSLATIONS = {
     defaultStationName: "New station",
     defaultSignalName: "New signal",
     tabExport: "Timetable export",
-    exportFrom: "From station",
-    exportTo: "to station",
-    exportNoRange: "Pick a start and end station.",
-    exportSameStation: "Start and end station must be different.",
+    exportNoRange: "Enable at least one line and pick its start/end stations.",
     exportWindowFrom: "Time range from",
     exportWindowTo: "to",
     exportStationsTitle: "Show departure time:",
@@ -492,8 +486,12 @@ export default function GraphicalTimetable() {
   const [winStart, setWinStart] = useState("00:45");
   const [winEnd, setWinEnd] = useState("02:05");
   const [scenarioName, setScenarioName] = useState("Fahrplan");
-  const [exportFromId, setExportFromId] = useState("");
-  const [exportToId, setExportToId] = useState("");
+  const [exportMainEnabled, setExportMainEnabled] = useState(true);
+  const [exportMainFromId, setExportMainFromId] = useState("");
+  const [exportMainToId, setExportMainToId] = useState("");
+  const [exportBranchEnabled, setExportBranchEnabled] = useState({});
+  const [exportBranchFromId, setExportBranchFromId] = useState({});
+  const [exportBranchToId, setExportBranchToId] = useState({});
   const [exportShowArrival, setExportShowArrival] = useState({});
   const [exportWinStart, setExportWinStart] = useState("00:00");
   const [exportWinEnd, setExportWinEnd] = useState("23:59");
@@ -1425,37 +1423,46 @@ export default function GraphicalTimetable() {
 
   // --- Table timetable export (tab "export") ---------------------------------------------
 
-  // Row groups for the printed table: the direct From→To path first, then — stacked below it,
-  // "similar to the station editing page" — any other branch that attaches somewhere along that
-  // path (and isn't already covered by it). Each row is a real station (signals are never rows).
-  function buildExportBlocks(fromId, toId) {
-    if (!fromId || !toId || fromId === toId) return null;
-    const primaryIds = pathBetween(fromId, toId);
-    if (!primaryIds || primaryIds.length < 2) return null;
-    const primaryIdSet = new Set(primaryIds);
-    // rowKey (not just station id) identifies a printed row: a branch's echoed junction row is
-    // the same station as its main-line row, but needs its own separate cell — a train can stop
-    // at the junction without continuing onto the branch (see computeExportColumns).
-    const primaryRows = primaryIds
-      .filter((id) => stationsById.get(id)?.kind !== "signal")
-      .map((id) => ({ id, rowKey: `0:${id}` }));
-    const blocks = [{ label: null, attachId: null, rows: primaryRows }];
+  // Walks a single, non-branching chain (main line, or one branch's own [attach, ...stations])
+  // from fromId to toId and returns the station ids in between, in that order (either
+  // direction). Returns null if either id isn't actually on this chain. Unlike pathBetween,
+  // this never crosses into another chain, so a branch selection can never accidentally pull in
+  // unrelated main-line stations — each line's row range is deterministic and self-contained.
+  function sliceChain(chain, fromId, toId) {
+    const filtered = chain.filter((s) => s.kind !== "signal");
+    const fromIdx = filtered.findIndex((s) => s.id === fromId);
+    const toIdx = filtered.findIndex((s) => s.id === toId);
+    if (fromIdx === -1 || toIdx === -1) return null;
+    const step = fromIdx <= toIdx ? 1 : -1;
+    const ids = [];
+    for (let i = fromIdx; step > 0 ? i <= toIdx : i >= toIdx; i += step) ids.push(filtered[i].id);
+    return ids;
+  }
+
+  // Row groups for the printed table: the main line (if enabled) plus every branch the user
+  // explicitly opted into, each with its own independently chosen From/To range — stacked below
+  // the main line "similar to the station editing page", in branch order. Each row is a real
+  // station (signals are never rows).
+  function buildExportBlocks() {
+    const blocks = [];
+    if (exportMainEnabled && exportMainFromId && exportMainToId) {
+      const ids = sliceChain(mainStations, exportMainFromId, exportMainToId);
+      if (ids) blocks.push({ label: null, attachId: null, rows: ids.map((id) => ({ id, rowKey: `0:${id}` })) });
+    }
     for (const br of branches) {
-      if (!primaryIdSet.has(br.fromStationId)) continue;
-      const bStations = (branchStationsMap.get(br.id) || []).filter((s) => s.kind !== "signal");
-      if (bStations.length === 0) continue;
-      if (bStations.every((s) => primaryIdSet.has(s.id))) continue; // already fully on the direct path
-      const blockKey = br.id;
+      if (!exportBranchEnabled[br.id]) continue;
+      const fromId = exportBranchFromId[br.id];
+      const toId = exportBranchToId[br.id];
+      if (!fromId || !toId) continue;
+      const ids = sliceChain(chainFor(br.id), fromId, toId);
+      if (!ids) continue;
       blocks.push({
         label: br.name,
         attachId: br.fromStationId,
-        rows: [
-          { id: br.fromStationId, echo: true, rowKey: `${blockKey}:${br.fromStationId}` },
-          ...bStations.map((s) => ({ id: s.id, rowKey: `${blockKey}:${s.id}` })),
-        ],
+        rows: ids.map((id) => ({ id, echo: id === br.fromStationId, rowKey: `${br.id}:${id}` })),
       });
     }
-    return blocks;
+    return blocks.length ? blocks : null;
   }
 
   // Every individual train run (a headway service expands into one column per occurrence),
@@ -1517,7 +1524,6 @@ export default function GraphicalTimetable() {
   // stop / "|" (runs through) / "/" (doesn't run here) cell for that trip.
   function computeExportColumns(blocks, trips, winStartMin, winEndMin) {
     const flatRows = blocks.flatMap((b) => b.rows);
-    const primaryRowIndex = new Map(blocks[0].rows.map((r, i) => [r.id, i]));
     const columns = [];
     for (const trip of trips) {
       const routeIndexById = new Map();
@@ -1525,31 +1531,48 @@ export default function GraphicalTimetable() {
         if (!routeIndexById.has(id)) routeIndexById.set(id, i);
       });
 
-      // Direction: only checked against the primary (From→To) rows this trip actually touches —
-      // their order along the trip's own route must match the table's row order.
-      const touched = [];
-      for (const r of blocks[0].rows) {
-        if (routeIndexById.has(r.id)) touched.push([primaryRowIndex.get(r.id), routeIndexById.get(r.id)]);
-      }
-      touched.sort((a, b) => a[0] - b[0]);
+      // Direction: checked independently against every enabled line — each has its own
+      // explicit From→To, so each imposes its own ordering constraint. The rows of any one
+      // line this trip actually touches must appear in the same order along the trip's own
+      // route as they do in that line's row list.
       let wrongDirection = false;
-      for (let i = 1; i < touched.length; i++) {
-        if (touched[i][1] < touched[i - 1][1]) { wrongDirection = true; break; }
+      for (const block of blocks) {
+        const touched = [];
+        block.rows.forEach((r, i) => {
+          if (routeIndexById.has(r.id)) touched.push([i, routeIndexById.get(r.id)]);
+        });
+        for (let i = 1; i < touched.length; i++) {
+          if (touched[i][1] < touched[i - 1][1]) { wrongDirection = true; break; }
+        }
+        if (wrongDirection) break;
       }
       if (wrongDirection) continue;
 
-      let firstT = null;
-      let lastT = null;
+      // Window-overlap span: the trip's actual physical presence across every printed row,
+      // from its earliest arrival-or-departure to its latest.
+      let presenceStart = null;
+      let presenceEnd = null;
       for (const r of flatRows) {
         const stop = trip.stopsByStation.get(r.id);
         if (!stop) continue;
         const s = stop.arr !== null ? stop.arr : stop.dep;
         const e = stop.dep !== null ? stop.dep : stop.arr;
-        if (firstT === null || s < firstT) firstT = s;
-        if (lastT === null || e > lastT) lastT = e;
+        if (presenceStart === null || s < presenceStart) presenceStart = s;
+        if (presenceEnd === null || e > presenceEnd) presenceEnd = e;
       }
-      if (firstT === null) continue; // no explicit stop anywhere printed — nothing to show
-      if (lastT < winStartMin - 1e-6 || firstT > winEndMin + 1e-6) continue;
+      if (presenceStart === null) continue; // no explicit stop anywhere printed — nothing to show
+      if (presenceEnd < winStartMin - 1e-6 || presenceStart > winEndMin + 1e-6) continue;
+
+      // Sort key: the departure (what's actually printed by default) at the first row — in
+      // table print order — this trip has a stop at. Not the same as presenceStart above, which
+      // prefers arrival and ignores table order.
+      let sortT = presenceStart;
+      for (const r of flatRows) {
+        const stop = trip.stopsByStation.get(r.id);
+        if (!stop) continue;
+        sortT = stop.dep !== null ? stop.dep : stop.arr;
+        break;
+      }
 
       const cells = {};
       for (const block of blocks) {
@@ -1570,9 +1593,9 @@ export default function GraphicalTimetable() {
           else cells[r.rowKey] = { kind: "none" };
         }
       }
-      columns.push({ tripId: trip.tripId, name: trip.name, color: trip.color, firstT, cells });
+      columns.push({ tripId: trip.tripId, name: trip.name, color: trip.color, sortT, cells });
     }
-    columns.sort((a, b) => a.firstT - b.firstT);
+    columns.sort((a, b) => a.sortT - b.sortT);
     return columns;
   }
 
@@ -1605,6 +1628,19 @@ export default function GraphicalTimetable() {
     if (cell.dep !== null) return toTimeStrFloorMin(cell.dep);
     if (cell.arr !== null) return toTimeStrFloorMin(cell.arr);
     return "";
+  }
+
+  // "Main line: Alpha → Delta · Branch1: Beta → Zeta" — one From→To summary per enabled line,
+  // used in both the on-screen preview title and the PDF title.
+  function exportLineSummary(blocks) {
+    return blocks
+      .map((b) => {
+        const label = b.label || t("mainStrecke");
+        const from = stationsById.get(b.rows[0].id)?.name || "";
+        const to = stationsById.get(b.rows[b.rows.length - 1].id)?.name || "";
+        return t("exportDirectionLabel", { from: `${label}: ${from}`, to });
+      })
+      .join(" · ");
   }
 
   const kursPaths = kurse.map((k) => {
@@ -1685,7 +1721,7 @@ export default function GraphicalTimetable() {
   let exportColumns = [];
   let exportPrintRows = [];
   if (tab === "export") {
-    exportBlocks = buildExportBlocks(exportFromId, exportToId);
+    exportBlocks = buildExportBlocks();
     if (exportBlocks) {
       const exportWinStartMin = toMin(exportWinStart) ?? 0;
       const exportWinEndMin = toMin(exportWinEnd) ?? 24 * 60;
@@ -1712,9 +1748,7 @@ export default function GraphicalTimetable() {
         const usableWidth = pageWidth - margin * 2 - stationColWidth - labelColWidth;
         const trainsPerPage = Math.max(1, Math.floor(usableWidth / minTrainColWidth));
 
-        const fromName = stationsById.get(exportFromId)?.name || "";
-        const toName = stationsById.get(exportToId)?.name || "";
-        const title = pdfSafe(`${scenarioName || t("defaultScenarioName")}: ${t("exportDirectionLabel", { from: fromName, to: toName })}`);
+        const title = pdfSafe(`${scenarioName || t("defaultScenarioName")}: ${exportLineSummary(exportBlocks)}`);
         const generatedAt = formatBuildTime(new Date().toISOString());
 
         const columnChunks = [];
@@ -1786,7 +1820,7 @@ export default function GraphicalTimetable() {
           });
         });
 
-        const safeName = `${scenarioName || t("defaultScenarioName")}-${fromName}-${toName}`.replace(/[^\w\-]+/g, "_");
+        const safeName = `${scenarioName || t("defaultScenarioName")}-timetable`.replace(/[^\w\-]+/g, "_");
         doc.save(`${safeName}.pdf`);
       } finally {
         setExportGenerating(false);
@@ -3188,25 +3222,6 @@ export default function GraphicalTimetable() {
         <div style={{ ...styles.panel, maxWidth: 1400 }}>
           <div style={styles.toolbarRow}>
             <label style={styles.windowLabel}>
-              {t("exportFrom")}
-              <select value={exportFromId} onChange={(e) => setExportFromId(e.target.value)}>
-                <option value="">—</option>
-                {stoppableStations.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <label style={styles.windowLabel}>
-              {t("exportTo")}
-              <select value={exportToId} onChange={(e) => setExportToId(e.target.value)}>
-                <option value="">—</option>
-                {stoppableStations.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <span style={styles.toolbarSep} />
-            <label style={styles.windowLabel}>
               {t("exportWindowFrom")}
               <input type="time" value={exportWinStart} onChange={(e) => setExportWinStart(e.target.value)} />
             </label>
@@ -3224,12 +3239,81 @@ export default function GraphicalTimetable() {
             </button>
           </div>
 
-          {(!exportFromId || !exportToId) ? (
-            <p style={{ color: "#5C6570", fontSize: 13 }}>{t("exportNoRange")}</p>
-          ) : exportFromId === exportToId ? (
-            <p style={{ color: "#B23A3A", fontSize: 13 }}>{t("exportSameStation")}</p>
-          ) : !exportBlocks ? (
-            <p style={{ color: "#B23A3A", fontSize: 13 }}>{t("exportNoRange")}</p>
+          <div style={styles.exportLinesList}>
+            <div style={styles.exportLineRow}>
+              <input
+                type="checkbox"
+                checked={exportMainEnabled}
+                onChange={(e) => setExportMainEnabled(e.target.checked)}
+              />
+              <span style={styles.exportLineName}>{t("mainStrecke")}</span>
+              <select
+                value={exportMainFromId}
+                onChange={(e) => setExportMainFromId(e.target.value)}
+                disabled={!exportMainEnabled}
+              >
+                <option value="">—</option>
+                {mainStations.filter((s) => s.kind !== "signal").map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+              <span style={styles.exportLineToLabel}>{t("rangeTo")}</span>
+              <select
+                value={exportMainToId}
+                onChange={(e) => setExportMainToId(e.target.value)}
+                disabled={!exportMainEnabled}
+              >
+                <option value="">—</option>
+                {mainStations.filter((s) => s.kind !== "signal").map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </div>
+            {branches.map((br) => {
+              const chain = chainFor(br.id).filter((s) => s.kind !== "signal");
+              const enabled = !!exportBranchEnabled[br.id];
+              return (
+                <div key={br.id} style={styles.exportLineRow}>
+                  <input
+                    type="checkbox"
+                    checked={enabled}
+                    onChange={(e) =>
+                      setExportBranchEnabled((prev) => ({ ...prev, [br.id]: e.target.checked }))
+                    }
+                  />
+                  <span style={styles.exportLineName}>{br.name}</span>
+                  <select
+                    value={exportBranchFromId[br.id] || ""}
+                    onChange={(e) =>
+                      setExportBranchFromId((prev) => ({ ...prev, [br.id]: e.target.value }))
+                    }
+                    disabled={!enabled}
+                  >
+                    <option value="">—</option>
+                    {chain.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                  <span style={styles.exportLineToLabel}>{t("rangeTo")}</span>
+                  <select
+                    value={exportBranchToId[br.id] || ""}
+                    onChange={(e) =>
+                      setExportBranchToId((prev) => ({ ...prev, [br.id]: e.target.value }))
+                    }
+                    disabled={!enabled}
+                  >
+                    <option value="">—</option>
+                    {chain.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+
+          {!exportBlocks ? (
+            <p style={{ color: "#5C6570", fontSize: 13, marginTop: 12 }}>{t("exportNoRange")}</p>
           ) : (
             <>
               <div style={{ marginTop: 16, marginBottom: 18 }}>
@@ -3303,10 +3387,7 @@ export default function GraphicalTimetable() {
               </div>
 
               <p style={{ fontSize: 13, fontWeight: 500, margin: "16px 0 8px" }}>
-                {t("exportPreviewTitle")} — {t("exportDirectionLabel", {
-                  from: stationsById.get(exportFromId)?.name,
-                  to: stationsById.get(exportToId)?.name,
-                })}
+                {t("exportPreviewTitle")} — {exportLineSummary(exportBlocks)}
                 {" · "}
                 {t("exportTrainsCount", { n: exportColumns.length })}
               </p>
@@ -4831,6 +4912,31 @@ const styles = {
     userSelect: "none",
     display: "inline-block",
     padding: "2px 4px",
+  },
+  exportLinesList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    background: "#fff",
+    border: "1px solid #D7DBD5",
+    borderRadius: 6,
+    padding: "12px 14px",
+    marginTop: 14,
+    maxWidth: 720,
+  },
+  exportLineRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 12.5,
+  },
+  exportLineName: {
+    minWidth: 110,
+    fontWeight: 500,
+  },
+  exportLineToLabel: {
+    fontSize: 12,
+    color: "#848C82",
   },
   exportTableWrap: {
     overflow: "auto",
