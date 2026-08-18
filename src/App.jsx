@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.4.1";
+const APP_VERSION = "1.4.2";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -1593,7 +1593,24 @@ export default function GraphicalTimetable() {
       }
       columns.push({ tripId: trip.tripId, name: trip.name, color: trip.color, sortT, cells });
     }
-    columns.sort((a, b) => a.sortT - b.sortT);
+    // Column order: comparing two trains by "each one's own first row" breaks down once they
+    // start from different rows — e.g. a train starting further down the table can have a
+    // smaller absolute time than one starting at the top, while still genuinely departing later
+    // from every row they actually share. So compare using the first row (in table order) BOTH
+    // trains have a real stop at; only fall back to each one's own sortT when they share none.
+    const rowKeysInOrder = flatRows.map((r) => r.rowKey);
+    columns.sort((a, b) => {
+      for (const rk of rowKeysInOrder) {
+        const ca = a.cells[rk];
+        const cb = b.cells[rk];
+        if (ca && ca.kind === "stop" && cb && cb.kind === "stop") {
+          const ta = ca.dep !== null ? ca.dep : ca.arr;
+          const tb = cb.dep !== null ? cb.dep : cb.arr;
+          if (ta !== tb) return ta - tb;
+        }
+      }
+      return a.sortT - b.sortT;
+    });
     return columns;
   }
 
