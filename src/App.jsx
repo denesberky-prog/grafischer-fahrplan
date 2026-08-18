@@ -3,7 +3,7 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.2.1";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -2213,7 +2213,7 @@ export default function GraphicalTimetable() {
                 title={sidebarCollapsed ? t("languageLabel") : undefined}
               >
                 <span>{sidebarCollapsed ? lang.toUpperCase() : (LANGUAGES.find((l) => l.code === lang) || {}).label || lang}</span>
-                <span style={styles.dropdownCaret}>▾</span>
+                {!sidebarCollapsed && <span style={styles.dropdownCaret}>▾</span>}
               </button>
               {langMenuOpen && (
                 <div style={styles.langMenu} role="listbox" aria-label={t("languageLabel")}>
