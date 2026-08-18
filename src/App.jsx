@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.3.1";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -14,6 +14,13 @@ function formatBuildTime(iso) {
   if (isNaN(d.getTime())) return "";
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// jsPDF's built-in fonts (base-14 PDF fonts, WinAnsi-encoded) cover umlauts and German
+// quotes fine, but not arrow/dingbat glyphs — those render as missing/blank in the PDF, so any
+// text going into it needs these swapped for plain ASCII first.
+function pdfSafe(str) {
+  return String(str).replace(/→/g, "->").replace(/↳/g, "->");
 }
 
 const PALETTE = ["#2B6CB0", "#C4432B", "#2F8F5B", "#7B4FA0", "#B8860B", "#1B2430", "#0E7C86", "#A23E7A"];
@@ -62,6 +69,16 @@ function toTimeStr(min) {
   if (s === 0) return `${hh}:${mm}`;
   const ss = String(s).padStart(2, "0");
   return `${hh}:${mm}:${ss}`;
+}
+
+// Printed timetables always round down to the whole minute (16:24:30 -> 16:24, never up) so
+// nobody reads a departure as later than it actually is.
+function toTimeStrFloorMin(min) {
+  const totalMinutes = Math.floor(min + 1e-9);
+  const wrapped = ((totalMinutes % 1440) + 1440) % 1440;
+  const h = Math.floor(wrapped / 60);
+  const m = wrapped % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
 function toKm(v) {
@@ -264,7 +281,7 @@ const TRANSLATIONS = {
     exportSameStation: "Start- und Zielstation dürfen nicht gleich sein.",
     exportWindowFrom: "Zeitraum von",
     exportWindowTo: "bis",
-    exportStationsTitle: "Stationen in dieser Tabelle",
+    exportStationsTitle: "Abfahrtszeit anzeigen:",
     exportShowArrival: "Ankunft zusätzlich anzeigen",
     exportBranchLabel: "↳ Zweig „{name}“ (ab {station})",
     exportNoTrains: "Keine Fahrten im gewählten Zeitraum auf diesem Abschnitt.",
@@ -441,7 +458,7 @@ const TRANSLATIONS = {
     exportSameStation: "Start and end station must be different.",
     exportWindowFrom: "Time range from",
     exportWindowTo: "to",
-    exportStationsTitle: "Stations in this table",
+    exportStationsTitle: "Show departure time:",
     exportShowArrival: "Also show arrival",
     exportBranchLabel: "↳ Branch \"{name}\" (from {station})",
     exportNoTrains: "No services run through this section in the selected time range.",
@@ -506,8 +523,10 @@ export default function GraphicalTimetable() {
   const [stationSpacing, setStationSpacing] = useState(72);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [kurseMenuOpen, setKurseMenuOpen] = useState(false);
+  const [exportStationsMenuOpen, setExportStationsMenuOpen] = useState(false);
   const langMenuRef = useRef(null);
   const kurseMenuRef = useRef(null);
+  const exportStationsMenuRef = useRef(null);
   const fileInputRef = useRef(null);
   const loadFileInputRef = useRef(null);
   const diagramWrapRef = useRef(null);
@@ -1361,6 +1380,7 @@ export default function GraphicalTimetable() {
   // instead of instantly reopening.
   useDropdownClose(langMenuOpen, setLangMenuOpen, langMenuRef);
   useDropdownClose(kurseMenuOpen, setKurseMenuOpen, kurseMenuRef);
+  useDropdownClose(exportStationsMenuOpen, setExportStationsMenuOpen, exportStationsMenuRef);
 
   const NICE_MINUTE_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
   const TARGET_GRID_PX = 36;
@@ -1413,19 +1433,26 @@ export default function GraphicalTimetable() {
     const primaryIds = pathBetween(fromId, toId);
     if (!primaryIds || primaryIds.length < 2) return null;
     const primaryIdSet = new Set(primaryIds);
+    // rowKey (not just station id) identifies a printed row: a branch's echoed junction row is
+    // the same station as its main-line row, but needs its own separate cell — a train can stop
+    // at the junction without continuing onto the branch (see computeExportColumns).
     const primaryRows = primaryIds
       .filter((id) => stationsById.get(id)?.kind !== "signal")
-      .map((id) => ({ id }));
+      .map((id) => ({ id, rowKey: `0:${id}` }));
     const blocks = [{ label: null, attachId: null, rows: primaryRows }];
     for (const br of branches) {
       if (!primaryIdSet.has(br.fromStationId)) continue;
       const bStations = (branchStationsMap.get(br.id) || []).filter((s) => s.kind !== "signal");
       if (bStations.length === 0) continue;
       if (bStations.every((s) => primaryIdSet.has(s.id))) continue; // already fully on the direct path
+      const blockKey = br.id;
       blocks.push({
         label: br.name,
         attachId: br.fromStationId,
-        rows: [{ id: br.fromStationId, echo: true }, ...bStations.map((s) => ({ id: s.id }))],
+        rows: [
+          { id: br.fromStationId, echo: true, rowKey: `${blockKey}:${br.fromStationId}` },
+          ...bStations.map((s) => ({ id: s.id, rowKey: `${blockKey}:${s.id}` })),
+        ],
       });
     }
     return blocks;
@@ -1525,11 +1552,23 @@ export default function GraphicalTimetable() {
       if (lastT < winStartMin - 1e-6 || firstT > winEndMin + 1e-6) continue;
 
       const cells = {};
-      for (const r of flatRows) {
-        const stop = trip.stopsByStation.get(r.id);
-        if (stop) cells[r.id] = { kind: "stop", arr: stop.arr, dep: stop.dep };
-        else if (routeIndexById.has(r.id)) cells[r.id] = { kind: "through" };
-        else cells[r.id] = { kind: "none" };
+      for (const block of blocks) {
+        // A branch's echoed junction row only makes sense for trips that actually continue onto
+        // that branch — for any other trip, a time there would look like it's heading onto the
+        // branch when it isn't, so force it to "/" regardless of what the main row shows.
+        const ownBranchIds = block.attachId
+          ? block.rows.filter((r) => !r.echo).map((r) => r.id)
+          : null;
+        for (const r of block.rows) {
+          if (r.echo && ownBranchIds && !ownBranchIds.some((id) => routeIndexById.has(id))) {
+            cells[r.rowKey] = { kind: "none" };
+            continue;
+          }
+          const stop = trip.stopsByStation.get(r.id);
+          if (stop) cells[r.rowKey] = { kind: "stop", arr: stop.arr, dep: stop.dep };
+          else if (routeIndexById.has(r.id)) cells[r.rowKey] = { kind: "through" };
+          else cells[r.rowKey] = { kind: "none" };
+        }
       }
       columns.push({ tripId: trip.tripId, name: trip.name, color: trip.color, firstT, cells });
     }
@@ -1545,10 +1584,10 @@ export default function GraphicalTimetable() {
       if (bi > 0) rows.push({ type: "divider", block });
       block.rows.forEach((r) => {
         if (exportShowArrival[r.id]) {
-          rows.push({ type: "an", stationId: r.id, echo: r.echo });
-          rows.push({ type: "ab", stationId: r.id, echo: r.echo });
+          rows.push({ type: "an", stationId: r.id, rowKey: r.rowKey, echo: r.echo });
+          rows.push({ type: "ab", stationId: r.id, rowKey: r.rowKey, echo: r.echo });
         } else {
-          rows.push({ type: "single", stationId: r.id, echo: r.echo });
+          rows.push({ type: "single", stationId: r.id, rowKey: r.rowKey, echo: r.echo });
         }
       });
     });
@@ -1559,12 +1598,12 @@ export default function GraphicalTimetable() {
     if (!cell) return "";
     if (cell.kind === "through") return "|";
     if (cell.kind === "none") return "/";
-    if (rowType === "an") return cell.arr !== null ? toTimeStr(cell.arr) : "";
-    if (rowType === "ab") return cell.dep !== null ? toTimeStr(cell.dep) : "";
+    if (rowType === "an") return cell.arr !== null ? toTimeStrFloorMin(cell.arr) : "";
+    if (rowType === "ab") return cell.dep !== null ? toTimeStrFloorMin(cell.dep) : "";
     // "single" row (departure only by default) — fall back to arrival at a terminus that has
     // no departure of its own.
-    if (cell.dep !== null) return toTimeStr(cell.dep);
-    if (cell.arr !== null) return toTimeStr(cell.arr);
+    if (cell.dep !== null) return toTimeStrFloorMin(cell.dep);
+    if (cell.arr !== null) return toTimeStrFloorMin(cell.arr);
     return "";
   }
 
@@ -1675,7 +1714,7 @@ export default function GraphicalTimetable() {
 
         const fromName = stationsById.get(exportFromId)?.name || "";
         const toName = stationsById.get(exportToId)?.name || "";
-        const title = `${scenarioName || t("defaultScenarioName")}: ${t("exportDirectionLabel", { from: fromName, to: toName })}`;
+        const title = pdfSafe(`${scenarioName || t("defaultScenarioName")}: ${t("exportDirectionLabel", { from: fromName, to: toName })}`);
         const generatedAt = formatBuildTime(new Date().toISOString());
 
         const columnChunks = [];
@@ -1691,7 +1730,7 @@ export default function GraphicalTimetable() {
             if (row.type === "divider") {
               body.push([
                 {
-                  content: t("exportBranchLabel", { name: row.block.label, station: stationsById.get(row.block.attachId)?.name }),
+                  content: pdfSafe(t("exportBranchLabel", { name: row.block.label, station: stationsById.get(row.block.attachId)?.name })),
                   colSpan: 2 + chunk.length,
                   styles: { fontStyle: "italic", fillColor: [242, 244, 241], textColor: [92, 101, 112] },
                 },
@@ -1711,7 +1750,7 @@ export default function GraphicalTimetable() {
               rowArr.push({ content: "ab", styles: { fontSize: 6, textColor: [132, 140, 130] } });
             }
             chunk.forEach((c) => {
-              const cell = c.cells[row.stationId];
+              const cell = c.cells[row.rowKey];
               const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
               if (row.type === "ab" && isSpanSymbol) return; // already rendered spanning from the "an" row
               rowArr.push({
@@ -3194,21 +3233,73 @@ export default function GraphicalTimetable() {
           ) : (
             <>
               <div style={{ marginTop: 16, marginBottom: 18 }}>
-                <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 6px" }}>{t("exportStationsTitle")}</p>
-                <div style={styles.exportStationsList}>
-                  {exportBlocks.flatMap((b) => b.rows).map((r) => (
-                    <label key={r.id} style={styles.exportStationCheckboxRow}>
-                      <input
-                        type="checkbox"
-                        checked={!!exportShowArrival[r.id]}
-                        onChange={(e) =>
-                          setExportShowArrival((prev) => ({ ...prev, [r.id]: e.target.checked }))
-                        }
-                      />
-                      <span>{stationsById.get(r.id)?.name}</span>
-                    </label>
-                  ))}
-                </div>
+                {(() => {
+                  // Dedupe by station id — a branch's echoed junction row is the same station as
+                  // its main-line row, and the checkbox (keyed by station id) controls both at once.
+                  const seenStationIds = new Set();
+                  const allExportRows = exportBlocks
+                    .flatMap((b) => b.rows)
+                    .filter((r) => (seenStationIds.has(r.id) ? false : (seenStationIds.add(r.id), true)));
+                  const checkedCount = allExportRows.filter((r) => exportShowArrival[r.id]).length;
+                  return (
+                    <div ref={exportStationsMenuRef} style={styles.kurseMenuWrap}>
+                      <button
+                        onClick={() => setExportStationsMenuOpen((o) => !o)}
+                        style={styles.kurseMenuTrigger}
+                        aria-haspopup="true"
+                        aria-expanded={exportStationsMenuOpen}
+                      >
+                        <span>{t("exportStationsTitle")}</span>
+                        <span style={styles.kurseMenuCount} className="mono">
+                          {checkedCount}/{allExportRows.length}
+                        </span>
+                        <span style={styles.dropdownCaret}>▾</span>
+                      </button>
+                      {exportStationsMenuOpen && (
+                        <div style={styles.kurseMenu}>
+                          <div style={styles.kurseMenuActions}>
+                            <button
+                              type="button"
+                              className="ghost-btn"
+                              style={styles.kurseMenuActionBtn}
+                              onClick={() =>
+                                setExportShowArrival(Object.fromEntries(allExportRows.map((r) => [r.id, true])))
+                              }
+                            >
+                              {t("kurseShowAll")}
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost-btn"
+                              style={styles.kurseMenuActionBtn}
+                              onClick={() =>
+                                setExportShowArrival(Object.fromEntries(allExportRows.map((r) => [r.id, false])))
+                              }
+                            >
+                              {t("kurseHideAll")}
+                            </button>
+                          </div>
+                          <div style={styles.legend}>
+                            {allExportRows.map((r) => (
+                              <label key={r.id} style={styles.legendItem}>
+                                <input
+                                  type="checkbox"
+                                  checked={!!exportShowArrival[r.id]}
+                                  onChange={(e) =>
+                                    setExportShowArrival((prev) => ({ ...prev, [r.id]: e.target.checked }))
+                                  }
+                                />
+                                <span className="mono" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>
+                                  {stationsById.get(r.id)?.name}
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               <p style={{ fontSize: 13, fontWeight: 500, margin: "16px 0 8px" }}>
@@ -3266,7 +3357,7 @@ export default function GraphicalTimetable() {
                             )}
                             <td style={styles.exportLabelCell}>{row.type === "single" ? "" : row.type}</td>
                             {exportColumns.map((c) => {
-                              const cell = c.cells[row.stationId];
+                              const cell = c.cells[row.rowKey];
                               const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
                               if (row.type === "ab" && isSpanSymbol) return null;
                               return (
@@ -4740,22 +4831,6 @@ const styles = {
     userSelect: "none",
     display: "inline-block",
     padding: "2px 4px",
-  },
-  exportStationsList: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "6px 18px",
-    background: "#fff",
-    border: "1px solid #D7DBD5",
-    borderRadius: 6,
-    padding: "10px 14px",
-    maxWidth: 900,
-  },
-  exportStationCheckboxRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    fontSize: 12.5,
   },
   exportTableWrap: {
     overflow: "auto",
