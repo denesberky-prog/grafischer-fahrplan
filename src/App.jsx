@@ -145,7 +145,7 @@ const TRANSLATIONS = {
     routeBandTitle: "Streckenband",
     segmentFieldsHint: "Diese Felder gelten jeweils für den Abschnitt zur vorherigen Station. Höchstgeschwindigkeit wird zusammen mit dem im Kurs gewählten Fahrzeugtyp für die automatische Fahrzeitberechnung und die Konflikterkennung verwendet. Gleise ist aktuell nur ein Datenfeld für eine spätere Funktion (Kreuzungsdarstellung).",
     distanceFirst: "–",
-    kmOptional: "optional",
+    kmOptional: "0.00",
     kmHint: "Die Reihenfolge der Stationen wird über die ↑/↓-Pfeile bestimmt, nicht über die Km-Angabe. Km ist rein informativ und wird nur für die maßstäbliche Darstellung sowie für automatische Fahrzeitberechnungen anhand von Distanzen verwendet.",
     colDwell: "Haltezeit (Min.)",
     colBranch: "Zweig",
@@ -304,7 +304,7 @@ const TRANSLATIONS = {
     routeBandTitle: "Route band",
     segmentFieldsHint: "These fields apply to the section leading to the previous station. Max speed is used together with the vehicle type selected on a service for automatic travel-time calculation and conflict detection. Tracks is currently just a data field for a future feature (crossing/meet display).",
     distanceFirst: "–",
-    kmOptional: "optional",
+    kmOptional: "0.00",
     kmHint: "The order of stations is set using the ↑/↓ arrows, not by the km value. Km is purely informational and only used for the to-scale view and for automatic travel-time calculations based on distance.",
     colDwell: "Dwell time (min.)",
     colBranch: "Branch",
@@ -1044,10 +1044,16 @@ export default function GraphicalTimetable() {
       return ys;
     };
     const els = [];
-    const drawSection = (xA, xB, key) => {
+    // stA/stB: the two endpoint stations/signals, so the short gap that visually marks a
+    // station stop can be skipped at a signal — the line stays unbroken through it (the
+    // signal's own dot marker is drawn on top, not a gap in the line).
+    const drawSection = (xA, stA, xB, stB, key) => {
       if (xA === null || xB === null) return;
-      const lo = Math.min(xA, xB) + STATION_HALF;
-      const hi = Math.max(xA, xB) - STATION_HALF;
+      const aIsLo = xA <= xB;
+      const gapLo = (aIsLo ? stA : stB).kind !== "signal" ? STATION_HALF : 0;
+      const gapHi = (aIsLo ? stB : stA).kind !== "signal" ? STATION_HALF : 0;
+      const lo = Math.min(xA, xB) + gapLo;
+      const hi = Math.max(xA, xB) - gapHi;
       if (hi <= lo) return;
       const raw = capacityAt(key);
       const m = raw === null ? 0 : raw;
@@ -1100,7 +1106,11 @@ export default function GraphicalTimetable() {
     // Hauptstrecke
     for (let i = 0; i < mainStations.length; i++) {
       if (i > 0) {
-        drawSection(xById(mainStations[i - 1].id), xById(mainStations[i].id), segKey(mainStations[i - 1].id, mainStations[i].id));
+        drawSection(
+          xById(mainStations[i - 1].id), mainStations[i - 1],
+          xById(mainStations[i].id), mainStations[i],
+          segKey(mainStations[i - 1].id, mainStations[i].id)
+        );
       }
     }
     mainStations.forEach((st, idx) => {
@@ -1117,7 +1127,11 @@ export default function GraphicalTimetable() {
       const seq = bp.stations; // [attach, ...own]
       const xOf = (st, idx) => (idx === 0 && bp.attach ? branchAttachX(bp) : xById(st.id));
       for (let i = 1; i < seq.length; i++) {
-        drawSection(xOf(seq[i - 1], i - 1), xOf(seq[i], i), segKey(seq[i - 1].id, seq[i].id));
+        drawSection(
+          xOf(seq[i - 1], i - 1), seq[i - 1],
+          xOf(seq[i], i), seq[i],
+          segKey(seq[i - 1].id, seq[i].id)
+        );
       }
       seq.forEach((st, idx) => {
         // Abzweigstation-Echo nur als Knoten zeichnen, wenn sie eigene Gleise hat
@@ -1885,8 +1899,9 @@ export default function GraphicalTimetable() {
         {stationList.slice(1).map((s, i) => {
           const key = segKey(stationList[i].id, s.id);
           const t = Math.max(0, capacityAt(key) || 0);
-          const y1 = rowCenter(i) + STATION_HALF;
-          const y2 = rowCenter(i + 1) - STATION_HALF;
+          // No gap on a signal's side — the line stays unbroken through it.
+          const y1 = rowCenter(i) + (stationList[i].kind !== "signal" ? STATION_HALF : 0);
+          const y2 = rowCenter(i + 1) - (s.kind !== "signal" ? STATION_HALF : 0);
           if (t === 0) {
             return <line key={key} x1={cx} y1={y1} x2={cx} y2={y2} stroke="#D7DBD5" strokeWidth="1" strokeDasharray="2 3" />;
           }
@@ -3626,7 +3641,8 @@ const styles = {
     fontFamily: "'IBM Plex Mono', monospace",
   },
   dropdownCaret: {
-    fontSize: 9,
+    fontSize: 27,
+    lineHeight: 1,
     opacity: 0.65,
     flexShrink: 0,
   },
@@ -3961,8 +3977,9 @@ const styles = {
     background: "transparent",
     border: "none",
     color: "#5C6570",
-    fontSize: 13,
-    width: 20,
+    fontSize: 39,
+    lineHeight: 1,
+    width: 40,
     flexShrink: 0,
     display: "flex",
     alignItems: "center",
