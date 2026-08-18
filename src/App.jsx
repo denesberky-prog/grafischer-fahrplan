@@ -134,7 +134,7 @@ const TRANSLATIONS = {
     noActions: "Keine Aktionen verfügbar",
     mainStrecke: "Hauptstrecke",
     colName: "Name",
-    colKm: "Km (Info)",
+    colKm: "km",
     colDistance: "Abstand",
     colMinFahrzeit: "Mindestfahrzeit",
     colMaxSpeed: "Höchstgeschw.",
@@ -156,6 +156,11 @@ const TRANSLATIONS = {
     moveDown: "Nach unten",
     removeStation: "Station löschen",
     addStation: "+ Station hinzufügen",
+    removeSignal: "Signal löschen",
+    addSignal: "+ Signal hinzufügen",
+    addSignalToBranch: '+ Signal zu "{name}" hinzufügen',
+    signalBadge: "Signal",
+    signalHint: "Signale unterteilen die Strecke zwischen Stationen in Blockabschnitte: In jedem Abschnitt zwischen Station–Station, Signal–Station oder Signal–Signal darf sich immer nur ein Zug befinden. So können mehrere Züge gleichzeitig zwischen zwei Stationen unterwegs sein.",
     branchesTitle: "Zweige (Abzweigungen)",
     branchesDesc: "Ein Zweig zweigt an einer Station der Hauptstrecke ab. Die Abzweigstation selbst wird automatisch als erste Station im Zweig mit angezeigt.",
     branchNamePlaceholder: "Zweigname",
@@ -235,6 +240,7 @@ const TRANSLATIONS = {
     defaultScenarioName: "Fahrplan",
     defaultKursName: "Kurs {n}",
     defaultStationName: "Neue Station",
+    defaultSignalName: "Neues Signal",
   },
   en: {
     eyebrow: "Line diagram",
@@ -287,7 +293,7 @@ const TRANSLATIONS = {
     noActions: "No actions available",
     mainStrecke: "Main line",
     colName: "Name",
-    colKm: "Km (info)",
+    colKm: "km",
     colDistance: "Distance",
     colMinFahrzeit: "Min. travel time",
     colMaxSpeed: "Max. speed",
@@ -309,6 +315,11 @@ const TRANSLATIONS = {
     moveDown: "Move down",
     removeStation: "Delete station",
     addStation: "+ Add station",
+    removeSignal: "Delete signal",
+    addSignal: "+ Add signal",
+    addSignalToBranch: '+ Add signal to "{name}"',
+    signalBadge: "Signal",
+    signalHint: "Signals subdivide the line between stations into block sections: only one train may be in any section between Station–Station, Signal–Station, or Signal–Signal at a time. This lets several trains be between two stations at once.",
     branchesTitle: "Branches",
     branchesDesc: "A branch splits off from a station on the main line. The junction station itself is automatically shown as the first station of the branch too.",
     branchNamePlaceholder: "Branch name",
@@ -388,6 +399,7 @@ const TRANSLATIONS = {
     defaultScenarioName: "Timetable",
     defaultKursName: "Service {n}",
     defaultStationName: "New station",
+    defaultSignalName: "New signal",
   },
 };
 
@@ -478,6 +490,11 @@ export default function GraphicalTimetable() {
     () => new Map(sortedStations.map((s, i) => [s.id, i])),
     [sortedStations]
   );
+  // Signals aren't stoppable — only real stations may be picked as a Kurs waypoint.
+  const stoppableStations = useMemo(
+    () => sortedStations.filter((s) => s.kind !== "signal"),
+    [sortedStations]
+  );
   const stationName = useMemo(
     () => new Map(sortedStations.map((s) => [s.id, s.name])),
     [sortedStations]
@@ -500,6 +517,42 @@ export default function GraphicalTimetable() {
     const attach = stations.find((s) => s.id === br.fromStationId);
     const bStations = branchStationsMap.get(branchId) || [];
     return attach ? [attach, ...bStations] : bStations;
+  }
+  // "Section tracks" (colTracks) is only ever configured on a real Station row, keyed by
+  // adjacent REAL station pairs. Signals add extra block boundaries between two real
+  // stations without a tracks field of their own, so every fine adjacent pair in the
+  // ordered line (station-or-signal to station-or-signal) needs to resolve back to the
+  // enclosing real-station-pair key that actually holds the configured capacity.
+  const capacityKeyMap = useMemo(() => {
+    const map = new Map();
+    const addChain = (chain) => {
+      for (let i = 0; i < chain.length - 1; i++) {
+        let pi = i;
+        while (pi >= 0 && chain[pi].kind === "signal") pi--;
+        let ni = i + 1;
+        while (ni < chain.length && chain[ni].kind === "signal") ni++;
+        if (pi < 0 || ni >= chain.length) continue;
+        map.set(segKey(chain[i].id, chain[i + 1].id), segKey(chain[pi].id, chain[ni].id));
+      }
+    };
+    addChain(mainStations);
+    for (const br of branches) addChain(chainFor(br.id));
+    return map;
+  }, [mainStations, branches, branchStationsMap, stations]);
+  // Allowed concurrent trains for a fine block segment, given its segKey(idA,idB) — see
+  // capacityKeyMap.
+  function capacityAt(key) {
+    const raw = parseInt(trackCounts[capacityKeyMap.get(key) ?? key], 10);
+    return isNaN(raw) ? null : Math.max(0, raw);
+  }
+  // Nearest real station at or before index idx in an ordered station/signal list, skipping
+  // signals — used to key the "Section tracks" input, which (like capacityKeyMap) always
+  // describes the span between two real stations, not a fine signal-bounded sub-segment.
+  function prevRealId(list, idx) {
+    for (let i = idx - 1; i >= 0; i--) {
+      if (list[i].kind !== "signal") return list[i].id;
+    }
+    return null;
   }
   // Liste aller physischen Stationen (in Reihenfolge) zwischen zwei Stationen, zweigfähig.
   function chainPath(chain, idA, idB) {
@@ -834,8 +887,8 @@ export default function GraphicalTimetable() {
     const sectionConflicts = [];
     const sectionWindows = new Map(); // segKey -> [[s,e],...]
     for (const [key, ivs] of sectionOcc.entries()) {
-      const raw = parseInt(trackCounts[key], 10);
-      if (isNaN(raw) || raw < 1) continue;
+      const raw = capacityAt(key);
+      if (raw === null || raw < 1) continue;
       const { count, atMin } = maxOverlapHalfOpen(ivs);
       if (count > raw) {
         let [idA, idB] = key.split("|");
@@ -996,8 +1049,8 @@ export default function GraphicalTimetable() {
       const lo = Math.min(xA, xB) + STATION_HALF;
       const hi = Math.max(xA, xB) - STATION_HALF;
       if (hi <= lo) return;
-      const raw = parseInt(trackCounts[key], 10);
-      const m = isNaN(raw) ? 0 : Math.max(0, raw);
+      const raw = capacityAt(key);
+      const m = raw === null ? 0 : raw;
       if (m === 0) {
         els.push(<line key={`sec-${key}`} x1={lo} y1={cy} x2={hi} y2={cy} stroke="#D7DBD5" strokeWidth={1} strokeDasharray="2 3" />);
         return;
@@ -1011,6 +1064,17 @@ export default function GraphicalTimetable() {
             strokeWidth={1.6}
           />
         );
+      });
+    };
+    // Signal nodes get a small dot per lane of the enclosing block section (see
+    // capacityKeyMap) instead of a station's platform-track ticks — shorter, so it reads
+    // as a boundary marker rather than a stop.
+    const drawSignalNode = (x, st, neighborKey) => {
+      if (x === null) return;
+      const raw = neighborKey !== null ? capacityAt(neighborKey) : null;
+      const n = Math.max(1, raw || 0);
+      laneYs(n).forEach((y, li) => {
+        els.push(<circle key={`sig-${st.id}-${li}`} cx={x} cy={y} r={1.3} fill="#171B1F" />);
       });
     };
     const drawNode = (x, st) => {
@@ -1039,7 +1103,15 @@ export default function GraphicalTimetable() {
         drawSection(xById(mainStations[i - 1].id), xById(mainStations[i].id), segKey(mainStations[i - 1].id, mainStations[i].id));
       }
     }
-    for (const st of mainStations) drawNode(xById(st.id), st);
+    mainStations.forEach((st, idx) => {
+      const x = xById(st.id);
+      if (st.kind === "signal") {
+        const neighborKey = idx > 0 ? segKey(mainStations[idx - 1].id, st.id) : null;
+        drawSignalNode(x, st, neighborKey);
+      } else {
+        drawNode(x, st);
+      }
+    });
     // Zweige
     branchPanels.forEach((bp) => {
       const seq = bp.stations; // [attach, ...own]
@@ -1051,8 +1123,11 @@ export default function GraphicalTimetable() {
         // Abzweigstation-Echo nur als Knoten zeichnen, wenn sie eigene Gleise hat
         if (idx === 0 && bp.attach) {
           drawNode(branchAttachX(bp), st);
+        } else if (st.kind === "signal") {
+          const neighborKey = idx > 0 ? segKey(seq[idx - 1].id, st.id) : null;
+          drawSignalNode(xOf(st, idx), st, neighborKey);
         } else {
-          drawNode(xById(st.id), st);
+          drawNode(xOf(st, idx), st);
         }
       });
     });
@@ -1275,6 +1350,17 @@ export default function GraphicalTimetable() {
       { id, name: t("defaultStationName"), km: "", dwell: "", branchId: null, order: maxOrder + 1 },
     ]);
   }
+  // Signals are lightweight points on the same ordered line as stations: only Name/Km/track
+  // speed apply. They act as block boundaries for train-conflict detection (see computeConflicts /
+  // capacityKeyMap) and get their own thin waypoint/max-speed leg, but are never a Kurs stop.
+  function addSignal() {
+    const maxOrder = mainStations.length ? Math.max(...mainStations.map((s) => s.order ?? 0)) : -1;
+    const id = uid();
+    setStations((prev) => [
+      ...prev,
+      { id, kind: "signal", name: t("defaultSignalName"), km: "", branchId: null, order: maxOrder + 1 },
+    ]);
+  }
   function removeStation(id) {
     setStations((prev) =>
       prev
@@ -1368,11 +1454,20 @@ export default function GraphicalTimetable() {
       { id, name: t("defaultStationName"), km: "", dwell: "", branchId, order: maxOrder + 1 },
     ]);
   }
+  function addSignalToBranch(branchId) {
+    const bStations = branchStationsMap.get(branchId) || [];
+    const maxOrder = bStations.length ? Math.max(...bStations.map((s) => s.order ?? 0)) : -1;
+    const id = uid();
+    setStations((prev) => [
+      ...prev,
+      { id, kind: "signal", name: t("defaultSignalName"), km: "", branchId, order: maxOrder + 1 },
+    ]);
+  }
 
   function addKurs() {
     const id = uid();
     const color = PALETTE[kurse.length % PALETTE.length];
-    const firstStation = sortedStations[0];
+    const firstStation = stoppableStations[0];
     setKurse((prev) => [
       ...prev,
       {
@@ -1449,7 +1544,7 @@ export default function GraphicalTimetable() {
         if (k.id !== kursId) return k;
         const lastStation = k.waypoints.length
           ? k.waypoints[k.waypoints.length - 1].stationId
-          : sortedStations[0] && sortedStations[0].id;
+          : stoppableStations[0] && stoppableStations[0].id;
         return {
           ...k,
           waypoints: [...k.waypoints, { wid: uid(), stationId: lastStation, arr: "", dep: "", dwell: "" }],
@@ -1459,15 +1554,17 @@ export default function GraphicalTimetable() {
   }
   function addStationRange(kursId) {
     const range = rangeInputs[kursId] || {};
-    const fromId = range.from || (sortedStations[0] && sortedStations[0].id);
-    const toId = range.to || (sortedStations[sortedStations.length - 1] && sortedStations[sortedStations.length - 1].id);
+    const fromId = range.from || (stoppableStations[0] && stoppableStations[0].id);
+    const toId = range.to || (stoppableStations[stoppableStations.length - 1] && stoppableStations[stoppableStations.length - 1].id);
     if (!fromId || !toId) return;
     const fromIdx = stationIndex.get(fromId);
     const toIdx = stationIndex.get(toId);
     if (fromIdx === undefined || toIdx === undefined) return;
     const step = fromIdx <= toIdx ? 1 : -1;
     const newWaypoints = [];
+    // Skip signals — a range only ever adds real, stoppable stations.
     for (let i = fromIdx; step > 0 ? i <= toIdx : i >= toIdx; i += step) {
+      if (sortedStations[i].kind === "signal") continue;
       newWaypoints.push({ wid: uid(), stationId: sortedStations[i].id, arr: "", dep: "", dwell: "" });
     }
     setKurse((prev) =>
@@ -1760,7 +1857,7 @@ export default function GraphicalTimetable() {
   // Schematisches Streckenband: zeichnet für eine Stationsfolge je Station so viele parallele
   // Linien wie Stationsgleise und je Abschnitt so viele wie Streckengleise. Läuft vertikal
   // synchron zur Stationstabelle (gleiche Zeilenhöhe ROW_H, halbe Höhe oben/unten als Rand).
-  function RouteBand({ stationList, sectionTracksFor }) {
+  function RouteBand({ stationList }) {
     const ROW_H = 41; // muss zur Tabellenzeilenhöhe passen
     const TOP_PAD = 8;
     const STATION_HALF = 8; // halbe Länge des Stationsknoten-Segments (in Laufrichtung = vertikal)
@@ -1770,10 +1867,7 @@ export default function GraphicalTimetable() {
     const maxTracks = Math.max(
       1,
       ...stationList.map((s) => Math.max(0, parseInt(s.stationTracks, 10) || 0)),
-      ...stationList.slice(1).map((s, i) => {
-        const key = segKey(stationList[i].id, stationList[i + 1].id);
-        return Math.max(0, parseInt(sectionTracksFor(key), 10) || 0);
-      })
+      ...stationList.slice(1).map((s, i) => Math.max(0, capacityAt(segKey(stationList[i].id, s.id)) || 0))
     );
     const trackGap = 4;
     const width = 24 + maxTracks * trackGap;
@@ -1790,8 +1884,7 @@ export default function GraphicalTimetable() {
         {/* Abschnitte: M durchgehende vertikale Linien zwischen den Stationen */}
         {stationList.slice(1).map((s, i) => {
           const key = segKey(stationList[i].id, s.id);
-          const raw = parseInt(sectionTracksFor(key), 10);
-          const t = Math.max(0, isNaN(raw) ? 0 : raw);
+          const t = Math.max(0, capacityAt(key) || 0);
           const y1 = rowCenter(i) + STATION_HALF;
           const y2 = rowCenter(i + 1) - STATION_HALF;
           if (t === 0) {
@@ -1809,11 +1902,22 @@ export default function GraphicalTimetable() {
             </g>
           );
         })}
-        {/* Stationen: N kurze vertikale Segmente (fixe Länge) */}
+        {/* Stationen: N kurze vertikale Segmente (fixe Länge); Signale: ein kurzer Punkt je Gleis */}
         {stationList.map((s, i) => {
+          const y = rowCenter(i);
+          if (s.kind === "signal") {
+            const neighborKey = i > 0 ? segKey(stationList[i - 1].id, s.id) : null;
+            const t = Math.max(1, (neighborKey !== null ? capacityAt(neighborKey) : null) || 0);
+            return (
+              <g key={s.id}>
+                {laneXs(t).map((x, li) => (
+                  <circle key={li} cx={x} cy={y} r="1.3" fill="#171B1F" />
+                ))}
+              </g>
+            );
+          }
           const raw = parseInt(s.stationTracks, 10);
           const t = Math.max(0, isNaN(raw) ? 0 : raw);
-          const y = rowCenter(i);
           if (t === 0) {
             return <circle key={s.id} cx={cx} cy={y} r="2.4" fill="#fff" stroke="#848C82" strokeWidth="1" />;
           }
@@ -2171,9 +2275,9 @@ export default function GraphicalTimetable() {
                     x={stationX(idx)}
                     y={HEADER_HEIGHT - TRACK_BAND_H - 8}
                     textAnchor="start"
-                    fontSize="12"
+                    fontSize={st.kind === "signal" ? "10" : "12"}
                     fontWeight="500"
-                    fill="#171B1F"
+                    fill={st.kind === "signal" ? "#848C82" : "#171B1F"}
                     transform={`rotate(-45 ${stationX(idx)} ${HEADER_HEIGHT - TRACK_BAND_H - 8})`}
                   >
                     {st.name}
@@ -2607,7 +2711,9 @@ export default function GraphicalTimetable() {
               </tr>
             </thead>
             <tbody>
-              {mainStations.map((st, idx) => (
+              {mainStations.map((st, idx) => {
+                const isSignal = st.kind === "signal";
+                return (
                 <tr
                   key={st.id}
                   onDragOver={(e) => {
@@ -2625,6 +2731,7 @@ export default function GraphicalTimetable() {
                   }}
                   style={{
                     opacity: draggedStationId === st.id ? 0.4 : 1,
+                    background: isSignal ? "#F5F1E8" : undefined,
                     borderTop: dragOverStationId === st.id && draggedStationId !== st.id ? "2px solid #9C7A2E" : undefined,
                   }}
                 >
@@ -2647,12 +2754,15 @@ export default function GraphicalTimetable() {
                     </span>
                   </td>
                   <td>
-                    <input
-                      type="text"
-                      value={st.name}
-                      onChange={(e) => updateStation(st.id, "name", e.target.value)}
-                      style={{ width: "100%" }}
-                    />
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="text"
+                        value={st.name}
+                        onChange={(e) => updateStation(st.id, "name", e.target.value)}
+                        style={{ width: "100%" }}
+                      />
+                      {isSignal && <span style={styles.signalBadge}>{t("signalBadge")}</span>}
+                    </div>
                   </td>
                   <td>
                     <input
@@ -2691,19 +2801,27 @@ export default function GraphicalTimetable() {
                     })()}
                   </td>
                   <td>
-                    <input
-                      type="number"
-                      min="0"
-                      step="1"
-                      value={st.stationTracks ?? ""}
-                      onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
-                      style={{ width: 60 }}
-                      placeholder="—"
-                    />
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={st.stationTracks ?? ""}
+                        onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
+                        style={{ width: 60 }}
+                        placeholder="—"
+                      />
+                    )}
                   </td>
                   <td>
-                    {idx > 0 && (() => {
-                      const key = segKey(mainStations[idx - 1].id, st.id);
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (() => {
+                      const prevId = prevRealId(mainStations, idx);
+                      if (!prevId) return null;
+                      const key = segKey(prevId, st.id);
                       return (
                         <input
                           type="number"
@@ -2718,32 +2836,44 @@ export default function GraphicalTimetable() {
                     })()}
                   </td>
                   <td>
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      value={st.dwell ?? ""}
-                      onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
-                      style={{ width: 90 }}
-                      placeholder="MM:SS"
-                    />
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={st.dwell ?? ""}
+                        onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
+                        style={{ width: 90 }}
+                        placeholder="MM:SS"
+                      />
+                    )}
                   </td>
                   <td>
-                    <button onClick={() => removeStation(st.id)} style={styles.iconBtn} aria-label={t("removeStation")}>
+                    <button
+                      onClick={() => removeStation(st.id)}
+                      style={styles.iconBtn}
+                      aria-label={isSignal ? t("removeSignal") : t("removeStation")}
+                    >
                       ✕
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
           </div>
           {mainStations.length > 0 && (
             <div style={{ paddingTop: 25 }} title={t("routeBandTitle")}>
-              <RouteBand stationList={mainStations} sectionTracksFor={(key) => trackCounts[key]} />
+              <RouteBand stationList={mainStations} />
             </div>
           )}
           </div>
-          <button onClick={addStation} style={styles.addBtn}>{t("addStation")}</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={addStation} style={styles.addBtn}>{t("addStation")}</button>
+            <button onClick={addSignal} style={styles.addBtn} title={t("signalHint")}>{t("addSignal")}</button>
+          </div>
 
           <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #D7DBD5" }}>
             <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 4px" }}>{t("branchesTitle")}</p>
@@ -2812,7 +2942,9 @@ export default function GraphicalTimetable() {
                           </tr>
                         ) : null;
                       })()}
-                      {bStations.map((st, idx) => (
+                      {bStations.map((st, idx) => {
+                        const isSignal = st.kind === "signal";
+                        return (
                         <tr
                           key={st.id}
                           onDragOver={(e) => {
@@ -2830,6 +2962,7 @@ export default function GraphicalTimetable() {
                           }}
                           style={{
                             opacity: draggedStationId === st.id ? 0.4 : 1,
+                            background: isSignal ? "#F5F1E8" : undefined,
                             borderTop: dragOverStationId === st.id && draggedStationId !== st.id ? "2px solid #9C7A2E" : undefined,
                           }}
                         >
@@ -2852,12 +2985,15 @@ export default function GraphicalTimetable() {
                             </span>
                           </td>
                           <td>
-                            <input
-                              type="text"
-                              value={st.name}
-                              onChange={(e) => updateStation(st.id, "name", e.target.value)}
-                              style={{ width: "100%" }}
-                            />
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <input
+                                type="text"
+                                value={st.name}
+                                onChange={(e) => updateStation(st.id, "name", e.target.value)}
+                                style={{ width: "100%" }}
+                              />
+                              {isSignal && <span style={styles.signalBadge}>{t("signalBadge")}</span>}
+                            </div>
                           </td>
                           <td>
                             <input
@@ -2897,19 +3033,26 @@ export default function GraphicalTimetable() {
                             })()}
                           </td>
                           <td>
-                            <input
-                              type="number"
-                              min="0"
-                              step="1"
-                              value={st.stationTracks ?? ""}
-                              onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
-                              style={{ width: 60 }}
-                              placeholder="—"
-                            />
+                            {isSignal ? (
+                              <span style={{ color: "#848C82" }}>—</span>
+                            ) : (
+                              <input
+                                type="number"
+                                min="0"
+                                step="1"
+                                value={st.stationTracks ?? ""}
+                                onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
+                                style={{ width: 60 }}
+                                placeholder="—"
+                              />
+                            )}
                           </td>
                           <td>
-                            {(() => {
-                              const prevId = idx === 0 ? (attachStation && attachStation.id) : bStations[idx - 1].id;
+                            {isSignal ? (
+                              <span style={{ color: "#848C82" }}>—</span>
+                            ) : (() => {
+                              const chain = attachStation ? [attachStation, ...bStations] : bStations;
+                              const prevId = prevRealId(chain, attachStation ? idx + 1 : idx);
                               if (!prevId) return null;
                               const key = segKey(prevId, st.id);
                               return (
@@ -2926,22 +3069,31 @@ export default function GraphicalTimetable() {
                             })()}
                           </td>
                           <td>
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              value={st.dwell ?? ""}
-                              onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
-                              style={{ width: 90 }}
-                              placeholder="MM:SS"
-                            />
+                            {isSignal ? (
+                              <span style={{ color: "#848C82" }}>—</span>
+                            ) : (
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                value={st.dwell ?? ""}
+                                onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
+                                style={{ width: 90 }}
+                                placeholder="MM:SS"
+                              />
+                            )}
                           </td>
                           <td>
-                            <button onClick={() => removeStation(st.id)} style={styles.iconBtn} aria-label={t("removeStation")}>
+                            <button
+                              onClick={() => removeStation(st.id)}
+                              style={styles.iconBtn}
+                              aria-label={isSignal ? t("removeSignal") : t("removeStation")}
+                            >
                               ✕
                             </button>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                   </div>
@@ -2949,14 +3101,19 @@ export default function GraphicalTimetable() {
                     const bandStations = attachStation ? [attachStation, ...bStations] : bStations;
                     return bandStations.length > 0 ? (
                       <div style={{ paddingTop: 25 }} title={t("routeBandTitle")}>
-                        <RouteBand stationList={bandStations} sectionTracksFor={(key) => trackCounts[key]} />
+                        <RouteBand stationList={bandStations} />
                       </div>
                     ) : null;
                   })()}
                   </div>
-                  <button onClick={() => addStationToBranch(br.id)} style={styles.addBtn}>
-                    {t("addStationToBranch", { name: br.name })}
-                  </button>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <button onClick={() => addStationToBranch(br.id)} style={styles.addBtn}>
+                      {t("addStationToBranch", { name: br.name })}
+                    </button>
+                    <button onClick={() => addSignalToBranch(br.id)} style={styles.addBtn} title={t("signalHint")}>
+                      {t("addSignalToBranch", { name: br.name })}
+                    </button>
+                  </div>
                 </div>
               );
             })}
@@ -3130,7 +3287,7 @@ export default function GraphicalTimetable() {
                           value={wp.stationId}
                           onChange={(e) => updateWaypoint(k.id, wp.wid, "stationId", e.target.value)}
                         >
-                          {sortedStations.map((st) => (
+                          {stoppableStations.map((st) => (
                             <option key={st.id} value={st.id}>{st.name}</option>
                           ))}
                         </select>
@@ -3170,11 +3327,11 @@ export default function GraphicalTimetable() {
               </table>
               <div style={styles.addStopsRow}>
                 <button onClick={() => addWaypoint(k.id)} style={styles.addBtn}>{t("addWaypoint")}</button>
-                {sortedStations.length > 1 && (
+                {stoppableStations.length > 1 && (
                   <>
                     <span style={{ fontSize: 12, color: "#848C82" }}>{t("orRange")}</span>
                     <select
-                      value={(rangeInputs[k.id] && rangeInputs[k.id].from) || sortedStations[0].id}
+                      value={(rangeInputs[k.id] && rangeInputs[k.id].from) || stoppableStations[0].id}
                       onChange={(e) =>
                         setRangeInputs((prev) => ({
                           ...prev,
@@ -3182,7 +3339,7 @@ export default function GraphicalTimetable() {
                         }))
                       }
                     >
-                      {sortedStations.map((st) => (
+                      {stoppableStations.map((st) => (
                         <option key={st.id} value={st.id}>{st.name}</option>
                       ))}
                     </select>
@@ -3190,7 +3347,7 @@ export default function GraphicalTimetable() {
                     <select
                       value={
                         (rangeInputs[k.id] && rangeInputs[k.id].to) ||
-                        sortedStations[sortedStations.length - 1].id
+                        stoppableStations[stoppableStations.length - 1].id
                       }
                       onChange={(e) =>
                         setRangeInputs((prev) => ({
@@ -3199,7 +3356,7 @@ export default function GraphicalTimetable() {
                         }))
                       }
                     >
-                      {sortedStations.map((st) => (
+                      {stoppableStations.map((st) => (
                         <option key={st.id} value={st.id}>{st.name}</option>
                       ))}
                     </select>
@@ -3928,6 +4085,18 @@ const styles = {
     border: "none",
     color: "#C4432B",
     fontSize: 12,
+  },
+  signalBadge: {
+    flexShrink: 0,
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 10,
+    letterSpacing: "0.04em",
+    textTransform: "uppercase",
+    color: "#9C7A2E",
+    background: "#F0E6CC",
+    border: "1px solid #E0CE9E",
+    borderRadius: 3,
+    padding: "1px 5px",
   },
   iconBtnNeutral: {
     background: "transparent",
