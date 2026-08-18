@@ -847,6 +847,7 @@ export default function GraphicalTimetable() {
       map.get(key).push({ s: Math.min(s, e), e: Math.max(s, e), kursId, dir });
     };
     for (const k of kurse) {
+      if (visible[k.id] === false) continue; // hidden services don't count toward conflicts
       const vehicle = vehicleForKurs(k);
       const resolved = resolveWaypoints(k.waypoints, vehicle);
       let baseFirst = null;
