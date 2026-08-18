@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.4.2";
+const APP_VERSION = "1.5.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -1611,7 +1611,64 @@ export default function GraphicalTimetable() {
       }
       return a.sortT - b.sortT;
     });
-    return columns;
+    return splitOvertakes(columns, flatRows);
+  }
+
+  // A column must read top-to-bottom as one continuous, increasing timeline. An overtake breaks
+  // that: train A (left) is overtaken by train B (right) at some station, so from there down A's
+  // times are earlier than B's while still sitting to A's own left — visually backwards. Real
+  // printed timetables fix this by splitting the overtaken train's column at that station: the
+  // arrival stays in A's original column, and a new column carrying A's departure and everything
+  // after is spliced in immediately right of B. Runs top-to-bottom once, re-scanning each row
+  // after every split since column positions shift (so a train overtaken twice gets a third
+  // segment automatically).
+  function splitOvertakes(columns, flatRows) {
+    let order = columns.map((c) => ({ ...c }));
+    for (const row of flatRows) {
+      const rk = row.rowKey;
+      let changed = true;
+      while (changed) {
+        changed = false;
+        const present = [];
+        order.forEach((col, idx) => {
+          const cell = col.cells[rk];
+          if (cell && cell.kind === "stop") {
+            present.push({ idx, t: cell.dep !== null ? cell.dep : cell.arr });
+          }
+        });
+        for (let i = 1; i < present.length; i++) {
+          const beforeIdx = present[i - 1].idx;
+          const overtakingIdx = present[i].idx;
+          if (present[i].t >= present[i - 1].t) continue;
+          const beforeCol = order[beforeIdx];
+          const beforeCell = beforeCol.cells[rk];
+          if (beforeCell.dep === null) continue; // terminates here — nothing to carry into a split
+
+          const afterCells = {};
+          const newBeforeCells = {};
+          let reachedSplit = false;
+          for (const r2 of flatRows) {
+            if (r2.rowKey === rk) {
+              newBeforeCells[r2.rowKey] = { kind: "stop", arr: beforeCell.arr, dep: null };
+              afterCells[r2.rowKey] = { kind: "stop", arr: null, dep: beforeCell.dep };
+              reachedSplit = true;
+              continue;
+            }
+            newBeforeCells[r2.rowKey] = reachedSplit ? { kind: "blank" } : beforeCol.cells[r2.rowKey];
+            afterCells[r2.rowKey] = reachedSplit ? beforeCol.cells[r2.rowKey] : { kind: "blank" };
+          }
+          order[beforeIdx] = { ...beforeCol, cells: newBeforeCells };
+          order.splice(overtakingIdx + 1, 0, {
+            ...beforeCol,
+            tripId: `${beforeCol.tripId}~split${rk}`,
+            cells: afterCells,
+          });
+          changed = true;
+          break;
+        }
+      }
+    }
+    return order;
   }
 
   // Flattens blocks into the actual printed rows, splitting a station into separate "an"/"ab"
@@ -1634,6 +1691,7 @@ export default function GraphicalTimetable() {
 
   function exportCellText(cell, rowType) {
     if (!cell) return "";
+    if (cell.kind === "blank") return ""; // the other half of a split (overtake) column — see splitOvertakes
     if (cell.kind === "through") return "|";
     if (cell.kind === "none") return "/";
     if (rowType === "an") return cell.arr !== null ? toTimeStrFloorMin(cell.arr) : "";
@@ -1806,7 +1864,7 @@ export default function GraphicalTimetable() {
             }
             chunk.forEach((c) => {
               const cell = c.cells[row.rowKey];
-              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
+              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none" || cell.kind === "blank");
               if (row.type === "ab" && isSpanSymbol) return; // already rendered spanning from the "an" row
               rowArr.push({
                 content: exportCellText(cell, row.type),
@@ -3455,7 +3513,7 @@ export default function GraphicalTimetable() {
                             <td style={styles.exportLabelCell}>{row.type === "single" ? "" : row.type}</td>
                             {exportColumns.map((c) => {
                               const cell = c.cells[row.rowKey];
-                              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
+                              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none" || cell.kind === "blank");
                               if (row.type === "ab" && isSpanSymbol) return null;
                               return (
                                 <td
