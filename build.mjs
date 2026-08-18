@@ -16,7 +16,10 @@ const result = await esbuild.build({
   minify: true,
   format: "iife",
   target: "es2019",
-  define: { "process.env.NODE_ENV": '"production"' },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+  },
   loader: { ".js": "jsx" },
 });
 

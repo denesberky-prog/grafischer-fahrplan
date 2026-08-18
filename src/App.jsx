@@ -1,5 +1,19 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 
+// Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
+// injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
+// never edited by hand.
+const APP_VERSION = "1.2.0";
+const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
+
+function formatBuildTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 const PALETTE = ["#2B6CB0", "#C4432B", "#2F8F5B", "#7B4FA0", "#B8860B", "#1B2430", "#0E7C86", "#A23E7A"];
 
 // Closes a dropdown when the user clicks/taps outside it or presses Escape.
@@ -2181,6 +2195,11 @@ export default function GraphicalTimetable() {
           </div>
 
           <div style={styles.sidebarFooter}>
+            {!sidebarCollapsed && (
+              <div style={styles.versionInfo} title={BUILD_TIME || undefined}>
+                v{APP_VERSION} · {formatBuildTime(BUILD_TIME)}
+              </div>
+            )}
             <div ref={langMenuRef} style={styles.langMenuWrap}>
               <button
                 onClick={() => setLangMenuOpen((o) => !o)}
@@ -3715,6 +3734,15 @@ const styles = {
     marginTop: "auto",
     paddingTop: 10,
     borderTop: "1px solid #D7DBD5",
+  },
+  versionInfo: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 10.5,
+    color: "#848C82",
+    marginBottom: 8,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
   },
   langToggleSidebar: {
     width: "100%",
