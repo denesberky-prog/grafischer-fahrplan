@@ -721,6 +721,15 @@ export default function GraphicalTimetable() {
     return { count: best, atMin: bestT };
   }
 
+  // Fixed direction per track: 1 track is a single shared bidirectional resource (capacity
+  // applies to both directions combined, unchanged from before); 2+ tracks are split as evenly
+  // as possible between the two directions, "asc" (ascending id order) getting the extra one
+  // on an odd count. Arbitrary tie-break, but stable per section.
+  function splitTrackCapacity(raw) {
+    if (raw < 2) return { shared: true, ascCap: raw, descCap: raw };
+    return { shared: false, ascCap: Math.ceil(raw / 2), descCap: Math.floor(raw / 2) };
+  }
+
   // Wie maxOverlap, aber mit halboffenen Intervallen [start, end): eine reine Berührung am Rand
   // (z. B. ein Zug fährt im Bahnhof ab, während der Gegenzug im selben Moment ankommt) zählt NICHT
   // als Konflikt. Verwendet für Streckenabschnitte – die Zugkreuzung findet im Bahnhof statt, nicht
@@ -788,10 +797,10 @@ export default function GraphicalTimetable() {
   // geprüft; ohne Angabe erfolgt keine Prüfung (kein Fehlalarm).
   function computeConflicts() {
     const stationOcc = new Map(); // stationId -> [{s,e,kursId,tripLabel}]
-    const sectionOcc = new Map(); // segKey -> [{s,e,kursId,tripLabel}]
-    const addOcc = (map, key, s, e, kursId) => {
+    const sectionOcc = new Map(); // segKey -> [{s,e,kursId,dir}]
+    const addOcc = (map, key, s, e, kursId, dir) => {
       if (!map.has(key)) map.set(key, []);
-      map.get(key).push({ s: Math.min(s, e), e: Math.max(s, e), kursId });
+      map.get(key).push({ s: Math.min(s, e), e: Math.max(s, e), kursId, dir });
     };
     for (const k of kurse) {
       const vehicle = vehicleForKurs(k);
@@ -848,6 +857,10 @@ export default function GraphicalTimetable() {
           let cum = 0;
           for (let pi = 0; pi < path.length - 1; pi++) {
             const key = segKey(path[pi], path[pi + 1]);
+            // "asc"/"desc" just means "same order as the canonical (sorted) key" or not — an
+            // arbitrary but consistent label per physical segment, used to tell the two
+            // directions of travel apart for capacity purposes (see splitTrackCapacity).
+            const dir = path[pi] === key.split("|")[0] ? "asc" : "desc";
             let entry, exit;
             if (total > 0) {
               entry = tA + ((cum) / total) * (tB - tA);
@@ -858,7 +871,7 @@ export default function GraphicalTimetable() {
             }
             cum += dists[pi];
             if (exit < minTime - 1e-6 || entry > maxTime + 1e-6) continue;
-            addOcc(sectionOcc, key, entry, exit, k.id);
+            addOcc(sectionOcc, key, entry, exit, k.id, dir);
           }
         }
         if (interval <= 0) break;
@@ -885,24 +898,39 @@ export default function GraphicalTimetable() {
       }
     }
     const sectionConflicts = [];
-    const sectionWindows = new Map(); // segKey -> [[s,e],...]
+    const sectionWindows = new Map(); // segKey -> { asc: [[s,e],...], desc: [[s,e],...] }
     for (const [key, ivs] of sectionOcc.entries()) {
       const raw = capacityAt(key);
       if (raw === null || raw < 1) continue;
-      const { count, atMin } = maxOverlapHalfOpen(ivs);
-      if (count > raw) {
-        let [idA, idB] = key.split("|");
-        const oa = stationIndex.get(idA);
-        const ob = stationIndex.get(idB);
-        if (oa !== undefined && ob !== undefined && ob < oa) {
-          [idA, idB] = [idB, idA];
-        }
-        const nameA = stationsById.get(idA)?.name || idA;
-        const nameB = stationsById.get(idB)?.name || idB;
-        sectionConflicts.push({ key, nameA, nameB, need: count, have: raw, atMin });
-        const wins = overCapacityWindows(ivs, raw, 0, true);
-        if (wins.length) sectionWindows.set(key, wins);
+      let [idA, idB] = key.split("|");
+      const oa = stationIndex.get(idA);
+      const ob = stationIndex.get(idB);
+      if (oa !== undefined && ob !== undefined && ob < oa) {
+        [idA, idB] = [idB, idA];
       }
+      const nameA = stationsById.get(idA)?.name || idA;
+      const nameB = stationsById.get(idB)?.name || idB;
+      const { shared, ascCap, descCap } = splitTrackCapacity(raw);
+      const winsForKey = {};
+      // shared: one physical track, so both directions draw from the same single pool (this is
+      // also what capacity 1 has always meant here). 2+ tracks: fixed direction per track, so
+      // "asc" and "desc" travel get their own independent capacity and are checked separately —
+      // a same-direction pile-up still conflicts even though the section overall isn't "full".
+      const checkDir = (dirIvs, cap, dirLabel) => {
+        const { count, atMin } = maxOverlapHalfOpen(dirIvs);
+        if (count <= cap) return;
+        sectionConflicts.push({ key, nameA, nameB, need: count, have: cap, atMin, dir: dirLabel });
+        const wins = overCapacityWindows(dirIvs, cap, 0, true);
+        if (wins.length) winsForKey[dirLabel] = wins;
+      };
+      if (shared) {
+        checkDir(ivs, raw, "asc");
+        if (winsForKey.asc) winsForKey.desc = winsForKey.asc;
+      } else {
+        checkDir(ivs.filter((iv) => iv.dir === "asc"), ascCap, "asc");
+        checkDir(ivs.filter((iv) => iv.dir === "desc"), descCap, "desc");
+      }
+      if (winsForKey.asc || winsForKey.desc) sectionWindows.set(key, winsForKey);
     }
     stationConflicts.sort((a, b) => (a.atMin ?? 0) - (b.atMin ?? 0));
     sectionConflicts.sort((a, b) => (a.atMin ?? 0) - (b.atMin ?? 0));
@@ -1344,7 +1372,10 @@ export default function GraphicalTimetable() {
     const e = Math.max(p1.min, p2.min);
     for (let i = 0; i < path.length - 1; i++) {
       const key = segKey(path[i], path[i + 1]);
-      const wins = conflictData.sectionWindows.get(key);
+      const byDir = conflictData.sectionWindows.get(key);
+      if (!byDir) continue;
+      const dir = path[i] === key.split("|")[0] ? "asc" : "desc";
+      const wins = byDir[dir];
       if (!wins) continue;
       for (const [ws, we] of wins) {
         if (s < we - 1e-9 && ws < e - 1e-9) return true; // echte Zeitüberlappung
@@ -2250,7 +2281,7 @@ export default function GraphicalTimetable() {
               const total = stationConflicts.length + sectionConflicts.length;
               const chips = [
                 ...sectionConflicts.map((c) => ({
-                  key: `s-${c.key}-${c.atMin}`,
+                  key: `s-${c.key}-${c.dir}-${c.atMin}`,
                   where: `${c.nameA}–${c.nameB}`,
                   at: c.atMin !== null ? toTimeStr(c.atMin) : "—",
                 })),
