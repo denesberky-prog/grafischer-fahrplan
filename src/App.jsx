@@ -1,9 +1,11 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { jsPDF } from "jspdf";
+import { autoTable } from "jspdf-autotable";
 
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.2.1";
+const APP_VERSION = "1.3.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -255,6 +257,24 @@ const TRANSLATIONS = {
     defaultKursName: "Kurs {n}",
     defaultStationName: "Neue Station",
     defaultSignalName: "Neues Signal",
+    tabExport: "Tabellenfahrplan",
+    exportFrom: "Von Station",
+    exportTo: "bis Station",
+    exportNoRange: "Bitte Start- und Zielstation wählen.",
+    exportSameStation: "Start- und Zielstation dürfen nicht gleich sein.",
+    exportWindowFrom: "Zeitraum von",
+    exportWindowTo: "bis",
+    exportStationsTitle: "Stationen in dieser Tabelle",
+    exportShowArrival: "Ankunft zusätzlich anzeigen",
+    exportBranchLabel: "↳ Zweig „{name}“ (ab {station})",
+    exportNoTrains: "Keine Fahrten im gewählten Zeitraum auf diesem Abschnitt.",
+    exportColStation: "Station",
+    exportSavePdf: "Als PDF speichern",
+    exportGenerating: "PDF wird erstellt…",
+    exportGeneratedAt: "Erstellt am {date}",
+    exportDirectionLabel: "{from} → {to}",
+    exportPreviewTitle: "Vorschau",
+    exportTrainsCount: "{n} Fahrten",
   },
   en: {
     eyebrow: "Line diagram",
@@ -414,6 +434,24 @@ const TRANSLATIONS = {
     defaultKursName: "Service {n}",
     defaultStationName: "New station",
     defaultSignalName: "New signal",
+    tabExport: "Timetable export",
+    exportFrom: "From station",
+    exportTo: "to station",
+    exportNoRange: "Pick a start and end station.",
+    exportSameStation: "Start and end station must be different.",
+    exportWindowFrom: "Time range from",
+    exportWindowTo: "to",
+    exportStationsTitle: "Stations in this table",
+    exportShowArrival: "Also show arrival",
+    exportBranchLabel: "↳ Branch \"{name}\" (from {station})",
+    exportNoTrains: "No services run through this section in the selected time range.",
+    exportColStation: "Station",
+    exportSavePdf: "Save as PDF",
+    exportGenerating: "Generating PDF…",
+    exportGeneratedAt: "Generated on {date}",
+    exportDirectionLabel: "{from} → {to}",
+    exportPreviewTitle: "Preview",
+    exportTrainsCount: "{n} services",
   },
 };
 
@@ -437,6 +475,12 @@ export default function GraphicalTimetable() {
   const [winStart, setWinStart] = useState("00:45");
   const [winEnd, setWinEnd] = useState("02:05");
   const [scenarioName, setScenarioName] = useState("Fahrplan");
+  const [exportFromId, setExportFromId] = useState("");
+  const [exportToId, setExportToId] = useState("");
+  const [exportShowArrival, setExportShowArrival] = useState({});
+  const [exportWinStart, setExportWinStart] = useState("00:00");
+  const [exportWinEnd, setExportWinEnd] = useState("23:59");
+  const [exportGenerating, setExportGenerating] = useState(false);
   const [lang, setLang] = useState("de");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   function t(key, vars) {
@@ -1359,6 +1403,171 @@ export default function GraphicalTimetable() {
     });
   }
 
+  // --- Table timetable export (tab "export") ---------------------------------------------
+
+  // Row groups for the printed table: the direct From→To path first, then — stacked below it,
+  // "similar to the station editing page" — any other branch that attaches somewhere along that
+  // path (and isn't already covered by it). Each row is a real station (signals are never rows).
+  function buildExportBlocks(fromId, toId) {
+    if (!fromId || !toId || fromId === toId) return null;
+    const primaryIds = pathBetween(fromId, toId);
+    if (!primaryIds || primaryIds.length < 2) return null;
+    const primaryIdSet = new Set(primaryIds);
+    const primaryRows = primaryIds
+      .filter((id) => stationsById.get(id)?.kind !== "signal")
+      .map((id) => ({ id }));
+    const blocks = [{ label: null, attachId: null, rows: primaryRows }];
+    for (const br of branches) {
+      if (!primaryIdSet.has(br.fromStationId)) continue;
+      const bStations = (branchStationsMap.get(br.id) || []).filter((s) => s.kind !== "signal");
+      if (bStations.length === 0) continue;
+      if (bStations.every((s) => primaryIdSet.has(s.id))) continue; // already fully on the direct path
+      blocks.push({
+        label: br.name,
+        attachId: br.fromStationId,
+        rows: [{ id: br.fromStationId, echo: true }, ...bStations.map((s) => ({ id: s.id }))],
+      });
+    }
+    return blocks;
+  }
+
+  // Every individual train run (a headway service expands into one column per occurrence),
+  // with its full physical route (for the |/ "runs through"/"doesn't run here" distinction) and
+  // its resolved stop times per station it's an explicit waypoint of.
+  function buildExportTrips(untilMin) {
+    const trips = [];
+    for (const k of kurse) {
+      if (visible[k.id] === false) continue;
+      const vehicle = vehicleForKurs(k);
+      const resolved = resolveWaypoints(k.waypoints, vehicle);
+      let baseFirst = null;
+      for (const rwp of resolved) {
+        if (rwp.arrMin !== null) { baseFirst = rwp.arrMin; break; }
+        if (rwp.depMin !== null) { baseFirst = rwp.depMin; break; }
+      }
+      if (baseFirst === null) continue;
+      const interval = Number(k.interval) || 0;
+      const endTimeMin = toMin(k.endTime);
+      let idx = 0;
+      while (true) {
+        const shift = interval > 0 ? idx * interval : 0;
+        const shiftedFirst = baseFirst + shift;
+        if (shiftedFirst > untilMin + 1e-6) break;
+        if (endTimeMin !== null && shiftedFirst > endTimeMin + 1e-6) break;
+        const stopsByStation = new Map();
+        const routeIds = [];
+        let truncated = false;
+        for (let wi = 0; wi < k.waypoints.length; wi++) {
+          const wp = k.waypoints[wi];
+          const rwp = resolved[wi];
+          const a = rwp.arrMin !== null ? rwp.arrMin + shift : null;
+          const d = rwp.depMin !== null ? rwp.depMin + shift : null;
+          if (endTimeMin !== null && ((a !== null && a > endTimeMin + 1e-6) || (d !== null && d > endTimeMin + 1e-6))) {
+            truncated = true;
+            break;
+          }
+          if (wi === 0) {
+            routeIds.push(wp.stationId);
+          } else {
+            const leg = pathBetween(k.waypoints[wi - 1].stationId, wp.stationId);
+            if (leg) routeIds.push(...leg.slice(1));
+          }
+          if (a !== null || d !== null) stopsByStation.set(wp.stationId, { arr: a, dep: d });
+        }
+        if (stopsByStation.size > 0) {
+          trips.push({ tripId: `${k.id}-${idx}`, name: k.name, color: k.color, stopsByStation, routeIds });
+        }
+        if (interval <= 0) break;
+        if (truncated) break;
+        idx++;
+        if (idx > 500) break;
+      }
+    }
+    return trips;
+  }
+
+  // Filters trips to the selected time window and direction, and resolves each printed row to a
+  // stop / "|" (runs through) / "/" (doesn't run here) cell for that trip.
+  function computeExportColumns(blocks, trips, winStartMin, winEndMin) {
+    const flatRows = blocks.flatMap((b) => b.rows);
+    const primaryRowIndex = new Map(blocks[0].rows.map((r, i) => [r.id, i]));
+    const columns = [];
+    for (const trip of trips) {
+      const routeIndexById = new Map();
+      trip.routeIds.forEach((id, i) => {
+        if (!routeIndexById.has(id)) routeIndexById.set(id, i);
+      });
+
+      // Direction: only checked against the primary (From→To) rows this trip actually touches —
+      // their order along the trip's own route must match the table's row order.
+      const touched = [];
+      for (const r of blocks[0].rows) {
+        if (routeIndexById.has(r.id)) touched.push([primaryRowIndex.get(r.id), routeIndexById.get(r.id)]);
+      }
+      touched.sort((a, b) => a[0] - b[0]);
+      let wrongDirection = false;
+      for (let i = 1; i < touched.length; i++) {
+        if (touched[i][1] < touched[i - 1][1]) { wrongDirection = true; break; }
+      }
+      if (wrongDirection) continue;
+
+      let firstT = null;
+      let lastT = null;
+      for (const r of flatRows) {
+        const stop = trip.stopsByStation.get(r.id);
+        if (!stop) continue;
+        const s = stop.arr !== null ? stop.arr : stop.dep;
+        const e = stop.dep !== null ? stop.dep : stop.arr;
+        if (firstT === null || s < firstT) firstT = s;
+        if (lastT === null || e > lastT) lastT = e;
+      }
+      if (firstT === null) continue; // no explicit stop anywhere printed — nothing to show
+      if (lastT < winStartMin - 1e-6 || firstT > winEndMin + 1e-6) continue;
+
+      const cells = {};
+      for (const r of flatRows) {
+        const stop = trip.stopsByStation.get(r.id);
+        if (stop) cells[r.id] = { kind: "stop", arr: stop.arr, dep: stop.dep };
+        else if (routeIndexById.has(r.id)) cells[r.id] = { kind: "through" };
+        else cells[r.id] = { kind: "none" };
+      }
+      columns.push({ tripId: trip.tripId, name: trip.name, color: trip.color, firstT, cells });
+    }
+    columns.sort((a, b) => a.firstT - b.firstT);
+    return columns;
+  }
+
+  // Flattens blocks into the actual printed rows, splitting a station into separate "an"/"ab"
+  // sub-rows when its arrival checkbox is on (default: departure only).
+  function buildExportPrintRows(blocks) {
+    const rows = [];
+    blocks.forEach((block, bi) => {
+      if (bi > 0) rows.push({ type: "divider", block });
+      block.rows.forEach((r) => {
+        if (exportShowArrival[r.id]) {
+          rows.push({ type: "an", stationId: r.id, echo: r.echo });
+          rows.push({ type: "ab", stationId: r.id, echo: r.echo });
+        } else {
+          rows.push({ type: "single", stationId: r.id, echo: r.echo });
+        }
+      });
+    });
+    return rows;
+  }
+
+  function exportCellText(cell, rowType) {
+    if (!cell) return "";
+    if (cell.kind === "through") return "|";
+    if (cell.kind === "none") return "/";
+    if (rowType === "an") return cell.arr !== null ? toTimeStr(cell.arr) : "";
+    if (rowType === "ab") return cell.dep !== null ? toTimeStr(cell.dep) : "";
+    // "single" row (departure only by default) — fall back to arrival at a terminus that has
+    // no departure of its own.
+    if (cell.dep !== null) return toTimeStr(cell.dep);
+    if (cell.arr !== null) return toTimeStr(cell.arr);
+    return "";
+  }
+
   const kursPaths = kurse.map((k) => {
     const vehicle = vehicleForKurs(k);
     const resolved = resolveWaypoints(k.waypoints, vehicle);
@@ -1432,6 +1641,119 @@ export default function GraphicalTimetable() {
   const conflictSectionKeys = new Set(conflictData.sectionConflicts.map((c) => c.key));
   const conflictStationIds = new Set(conflictData.stationConflicts.map((c) => c.stationId));
   const visibleKurseCount = kurse.filter((k) => visible[k.id] !== false).length;
+
+  let exportBlocks = null;
+  let exportColumns = [];
+  let exportPrintRows = [];
+  if (tab === "export") {
+    exportBlocks = buildExportBlocks(exportFromId, exportToId);
+    if (exportBlocks) {
+      const exportWinStartMin = toMin(exportWinStart) ?? 0;
+      const exportWinEndMin = toMin(exportWinEnd) ?? 24 * 60;
+      const trips = buildExportTrips(Math.max(exportWinEndMin, 24 * 60));
+      exportColumns = computeExportColumns(exportBlocks, trips, exportWinStartMin, exportWinEndMin);
+      exportPrintRows = buildExportPrintRows(exportBlocks);
+    }
+  }
+
+  // Renders the current preview (exportBlocks/exportColumns/exportPrintRows) into a real,
+  // paginated PDF: trains are chunked into as many columns as fit the page width, each chunk
+  // becomes its own page group repeating the full station list on the left.
+  function handleExportPdf() {
+    if (!exportBlocks || exportColumns.length === 0) return;
+    setExportGenerating(true);
+    setTimeout(() => {
+      try {
+        const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const margin = 10;
+        const stationColWidth = 40;
+        const labelColWidth = 7;
+        const minTrainColWidth = 15;
+        const usableWidth = pageWidth - margin * 2 - stationColWidth - labelColWidth;
+        const trainsPerPage = Math.max(1, Math.floor(usableWidth / minTrainColWidth));
+
+        const fromName = stationsById.get(exportFromId)?.name || "";
+        const toName = stationsById.get(exportToId)?.name || "";
+        const title = `${scenarioName || t("defaultScenarioName")}: ${t("exportDirectionLabel", { from: fromName, to: toName })}`;
+        const generatedAt = formatBuildTime(new Date().toISOString());
+
+        const columnChunks = [];
+        for (let i = 0; i < exportColumns.length; i += trainsPerPage) {
+          columnChunks.push(exportColumns.slice(i, i + trainsPerPage));
+        }
+
+        columnChunks.forEach((chunk, chunkIdx) => {
+          if (chunkIdx > 0) doc.addPage();
+          const head = [[t("exportColStation"), "", ...chunk.map((c) => c.name)]];
+          const body = [];
+          exportPrintRows.forEach((row) => {
+            if (row.type === "divider") {
+              body.push([
+                {
+                  content: t("exportBranchLabel", { name: row.block.label, station: stationsById.get(row.block.attachId)?.name }),
+                  colSpan: 2 + chunk.length,
+                  styles: { fontStyle: "italic", fillColor: [242, 244, 241], textColor: [92, 101, 112] },
+                },
+              ]);
+              return;
+            }
+            const st = stationsById.get(row.stationId);
+            const rowArr = [];
+            if (row.type !== "ab") {
+              rowArr.push({
+                content: st?.name || "",
+                rowSpan: row.type === "an" ? 2 : 1,
+                styles: row.echo ? { fontStyle: "italic", textColor: [132, 140, 130] } : { fontStyle: "bold" },
+              });
+              rowArr.push({ content: row.type === "an" ? "an" : "", styles: { fontSize: 6, textColor: [132, 140, 130] } });
+            } else {
+              rowArr.push({ content: "ab", styles: { fontSize: 6, textColor: [132, 140, 130] } });
+            }
+            chunk.forEach((c) => {
+              const cell = c.cells[row.stationId];
+              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
+              if (row.type === "ab" && isSpanSymbol) return; // already rendered spanning from the "an" row
+              rowArr.push({
+                content: exportCellText(cell, row.type),
+                rowSpan: row.type === "an" && isSpanSymbol ? 2 : 1,
+                styles: isSpanSymbol
+                  ? { halign: "center", valign: "middle", textColor: [190, 190, 190] }
+                  : { halign: "center", valign: "middle" },
+              });
+            });
+            body.push(rowArr);
+          });
+
+          autoTable(doc, {
+            head,
+            body,
+            startY: 22,
+            margin: { top: 22, left: margin, right: margin, bottom: 12 },
+            styles: { fontSize: 7.5, cellPadding: 1.3, valign: "middle", lineColor: [215, 219, 213], lineWidth: 0.1 },
+            headStyles: { fillColor: [23, 27, 31], textColor: [255, 255, 255], fontSize: 7.5, halign: "center" },
+            columnStyles: { 0: { cellWidth: stationColWidth, halign: "left" }, 1: { cellWidth: labelColWidth, halign: "center" } },
+            didDrawPage: () => {
+              doc.setFontSize(11);
+              doc.setFont(undefined, "bold");
+              doc.text(title, margin, 12);
+              doc.setFont(undefined, "normal");
+              doc.setFontSize(8);
+              doc.text(t("exportGeneratedAt", { date: generatedAt }), margin, 17);
+              if (columnChunks.length > 1) {
+                doc.text(`${chunkIdx + 1} / ${columnChunks.length}`, pageWidth - margin, 12, { align: "right" });
+              }
+            },
+          });
+        });
+
+        const safeName = `${scenarioName || t("defaultScenarioName")}-${fromName}-${toName}`.replace(/[^\w\-]+/g, "_");
+        doc.save(`${safeName}.pdf`);
+      } finally {
+        setExportGenerating(false);
+      }
+    }, 0);
+  }
 
   // Prüft, ob ein Zugsegment (p1→p2) auf einem überbelegten Abschnitt in dessen Konfliktzeitfenster
   // liegt. Deckt auch Durchfahrten über mehrere Stationen ab (jeder Teilabschnitt wird geprüft).
@@ -2096,6 +2418,12 @@ export default function GraphicalTimetable() {
       <rect x="5" y="9" width="6" height="4" stroke="currentColor" strokeWidth="1.2" />
     </svg>
   );
+  const IconExport = () => (
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+      <rect x="2" y="2.5" width="12" height="11" rx="1" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M2 6.5 H14 M6 6.5 V13.5" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
   const IconCollapse = ({ collapsed }) => (
     <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
       {collapsed ? (
@@ -2106,7 +2434,10 @@ export default function GraphicalTimetable() {
     </svg>
   );
 
-  const navMain = [{ key: "diagram", label: t("tabDiagram"), Icon: IconDiagram }];
+  const navMain = [
+    { key: "diagram", label: t("tabDiagram"), Icon: IconDiagram },
+    { key: "export", label: t("tabExport"), Icon: IconExport },
+  ];
   const navData = [
     { key: "stations", label: t("tabStations"), Icon: IconStations },
     { key: "kurse", label: t("tabKurse"), Icon: IconKurse },
@@ -2810,6 +3141,155 @@ export default function GraphicalTimetable() {
                 <div style={styles.contextMenuEmpty}>{t("noActions")}</div>
               )}
             </div>
+          )}
+        </div>
+      )}
+
+      {tab === "export" && (
+        <div style={{ ...styles.panel, maxWidth: 1400 }}>
+          <div style={styles.toolbarRow}>
+            <label style={styles.windowLabel}>
+              {t("exportFrom")}
+              <select value={exportFromId} onChange={(e) => setExportFromId(e.target.value)}>
+                <option value="">—</option>
+                {stoppableStations.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </label>
+            <label style={styles.windowLabel}>
+              {t("exportTo")}
+              <select value={exportToId} onChange={(e) => setExportToId(e.target.value)}>
+                <option value="">—</option>
+                {stoppableStations.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </label>
+            <span style={styles.toolbarSep} />
+            <label style={styles.windowLabel}>
+              {t("exportWindowFrom")}
+              <input type="time" value={exportWinStart} onChange={(e) => setExportWinStart(e.target.value)} />
+            </label>
+            <label style={styles.windowLabel}>
+              {t("exportWindowTo")}
+              <input type="time" value={exportWinEnd} onChange={(e) => setExportWinEnd(e.target.value)} />
+            </label>
+            <span style={styles.toolbarSep} />
+            <button
+              onClick={handleExportPdf}
+              style={styles.addBtn}
+              disabled={!exportBlocks || exportColumns.length === 0 || exportGenerating}
+            >
+              {exportGenerating ? t("exportGenerating") : t("exportSavePdf")}
+            </button>
+          </div>
+
+          {(!exportFromId || !exportToId) ? (
+            <p style={{ color: "#5C6570", fontSize: 13 }}>{t("exportNoRange")}</p>
+          ) : exportFromId === exportToId ? (
+            <p style={{ color: "#B23A3A", fontSize: 13 }}>{t("exportSameStation")}</p>
+          ) : !exportBlocks ? (
+            <p style={{ color: "#B23A3A", fontSize: 13 }}>{t("exportNoRange")}</p>
+          ) : (
+            <>
+              <div style={{ marginTop: 16, marginBottom: 18 }}>
+                <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 6px" }}>{t("exportStationsTitle")}</p>
+                <div style={styles.exportStationsList}>
+                  {exportBlocks.flatMap((b) => b.rows).map((r) => (
+                    <label key={r.id} style={styles.exportStationCheckboxRow}>
+                      <input
+                        type="checkbox"
+                        checked={!!exportShowArrival[r.id]}
+                        onChange={(e) =>
+                          setExportShowArrival((prev) => ({ ...prev, [r.id]: e.target.checked }))
+                        }
+                      />
+                      <span>{stationsById.get(r.id)?.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <p style={{ fontSize: 13, fontWeight: 500, margin: "16px 0 8px" }}>
+                {t("exportPreviewTitle")} — {t("exportDirectionLabel", {
+                  from: stationsById.get(exportFromId)?.name,
+                  to: stationsById.get(exportToId)?.name,
+                })}
+                {" · "}
+                {t("exportTrainsCount", { n: exportColumns.length })}
+              </p>
+
+              {exportColumns.length === 0 ? (
+                <p style={{ color: "#5C6570", fontSize: 13 }}>{t("exportNoTrains")}</p>
+              ) : (
+                <div style={styles.exportTableWrap}>
+                  <table style={styles.exportTable}>
+                    <thead>
+                      <tr>
+                        <th style={styles.exportStationHeaderCell}>{t("exportColStation")}</th>
+                        <th style={styles.exportLabelHeaderCell}></th>
+                        {exportColumns.map((c) => (
+                          <th key={c.tripId} style={{ ...styles.exportTrainHeaderCell, color: c.color }}>
+                            {c.name}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {exportPrintRows.map((row, ri) => {
+                        if (row.type === "divider") {
+                          return (
+                            <tr key={`div-${ri}`}>
+                              <td colSpan={2 + exportColumns.length} style={styles.exportDividerCell}>
+                                {t("exportBranchLabel", {
+                                  name: row.block.label,
+                                  station: stationsById.get(row.block.attachId)?.name,
+                                })}
+                              </td>
+                            </tr>
+                          );
+                        }
+                        const st = stationsById.get(row.stationId);
+                        return (
+                          <tr key={`${row.stationId}-${row.type}-${ri}`}>
+                            {row.type !== "ab" && (
+                              <td
+                                rowSpan={row.type === "an" ? 2 : 1}
+                                style={{
+                                  ...styles.exportStationCell,
+                                  ...(row.echo ? styles.exportEchoCell : {}),
+                                }}
+                              >
+                                {st?.name}
+                              </td>
+                            )}
+                            <td style={styles.exportLabelCell}>{row.type === "single" ? "" : row.type}</td>
+                            {exportColumns.map((c) => {
+                              const cell = c.cells[row.stationId];
+                              const isSpanSymbol = cell && (cell.kind === "through" || cell.kind === "none");
+                              if (row.type === "ab" && isSpanSymbol) return null;
+                              return (
+                                <td
+                                  key={c.tripId}
+                                  rowSpan={row.type === "an" && isSpanSymbol ? 2 : 1}
+                                  style={{
+                                    ...styles.exportCell,
+                                    ...(isSpanSymbol ? styles.exportCellSymbol : {}),
+                                  }}
+                                >
+                                  {exportCellText(cell, row.type)}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -4260,5 +4740,110 @@ const styles = {
     userSelect: "none",
     display: "inline-block",
     padding: "2px 4px",
+  },
+  exportStationsList: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "6px 18px",
+    background: "#fff",
+    border: "1px solid #D7DBD5",
+    borderRadius: 6,
+    padding: "10px 14px",
+    maxWidth: 900,
+  },
+  exportStationCheckboxRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12.5,
+  },
+  exportTableWrap: {
+    overflow: "auto",
+    border: "1px solid #D7DBD5",
+    borderRadius: 6,
+    maxHeight: "70vh",
+  },
+  exportTable: {
+    borderCollapse: "collapse",
+    fontSize: 12,
+  },
+  exportStationHeaderCell: {
+    position: "sticky",
+    left: 0,
+    top: 0,
+    zIndex: 3,
+    background: "#171B1F",
+    color: "#F2F4F1",
+    padding: "7px 10px",
+    textAlign: "left",
+    minWidth: 160,
+    borderBottom: "1px solid #171B1F",
+  },
+  exportLabelHeaderCell: {
+    position: "sticky",
+    left: 160,
+    top: 0,
+    zIndex: 3,
+    background: "#171B1F",
+    borderBottom: "1px solid #171B1F",
+    minWidth: 28,
+  },
+  exportTrainHeaderCell: {
+    position: "sticky",
+    top: 0,
+    zIndex: 2,
+    background: "#171B1F",
+    padding: "7px 8px",
+    textAlign: "center",
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+    borderBottom: "1px solid #171B1F",
+  },
+  exportStationCell: {
+    position: "sticky",
+    left: 0,
+    zIndex: 1,
+    background: "#fff",
+    padding: "5px 10px",
+    fontWeight: 500,
+    whiteSpace: "nowrap",
+    borderBottom: "1px solid #D7DBD5",
+    borderRight: "1px solid #D7DBD5",
+  },
+  exportEchoCell: {
+    fontStyle: "italic",
+    color: "#848C82",
+    fontWeight: 400,
+  },
+  exportLabelCell: {
+    position: "sticky",
+    left: 160,
+    zIndex: 1,
+    background: "#fff",
+    padding: "5px 4px",
+    fontSize: 10.5,
+    color: "#848C82",
+    textAlign: "center",
+    borderBottom: "1px solid #D7DBD5",
+    borderRight: "1px solid #D7DBD5",
+  },
+  exportCell: {
+    padding: "5px 8px",
+    textAlign: "center",
+    fontFamily: "'IBM Plex Mono', monospace",
+    whiteSpace: "nowrap",
+    borderBottom: "1px solid #D7DBD5",
+  },
+  exportCellSymbol: {
+    color: "#C7CCC3",
+  },
+  exportDividerCell: {
+    background: "#F2F4F1",
+    color: "#5C6570",
+    fontStyle: "italic",
+    fontSize: 12,
+    padding: "6px 10px",
+    borderBottom: "1px solid #D7DBD5",
+    borderTop: "1px solid #D7DBD5",
   },
 };
