@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.4.1";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -280,7 +280,6 @@ const TRANSLATIONS = {
     exportWindowTo: "bis",
     exportStationsTitle: "Abfahrtszeit anzeigen:",
     exportShowArrival: "Ankunft zusätzlich anzeigen",
-    exportBranchLabel: "↳ Zweig „{name}“ (ab {station})",
     exportNoTrains: "Keine Fahrten im gewählten Zeitraum auf diesem Abschnitt.",
     exportColStation: "Station",
     exportSavePdf: "Als PDF speichern",
@@ -454,7 +453,6 @@ const TRANSLATIONS = {
     exportWindowTo: "to",
     exportStationsTitle: "Show departure time:",
     exportShowArrival: "Also show arrival",
-    exportBranchLabel: "↳ Branch \"{name}\" (from {station})",
     exportNoTrains: "No services run through this section in the selected time range.",
     exportColStation: "Station",
     exportSavePdf: "Save as PDF",
@@ -1764,9 +1762,15 @@ export default function GraphicalTimetable() {
             if (row.type === "divider") {
               body.push([
                 {
-                  content: pdfSafe(t("exportBranchLabel", { name: row.block.label, station: stationsById.get(row.block.attachId)?.name })),
+                  content: "",
                   colSpan: 2 + chunk.length,
-                  styles: { fontStyle: "italic", fillColor: [242, 244, 241], textColor: [92, 101, 112] },
+                  styles: {
+                    fillColor: [242, 244, 241],
+                    minCellHeight: 2.5,
+                    cellPadding: 0,
+                    lineWidth: { top: 0.15, bottom: 0.15, left: 0, right: 0 },
+                    lineColor: [215, 219, 213],
+                  },
                 },
               ]);
               return;
@@ -3413,12 +3417,7 @@ export default function GraphicalTimetable() {
                         if (row.type === "divider") {
                           return (
                             <tr key={`div-${ri}`}>
-                              <td colSpan={2 + exportColumns.length} style={styles.exportDividerCell}>
-                                {t("exportBranchLabel", {
-                                  name: row.block.label,
-                                  station: stationsById.get(row.block.attachId)?.name,
-                                })}
-                              </td>
+                              <td colSpan={2 + exportColumns.length} style={styles.exportDividerCell} />
                             </tr>
                           );
                         }
@@ -5019,12 +5018,12 @@ const styles = {
     color: "#C7CCC3",
   },
   exportDividerCell: {
+    height: 10,
+    padding: 0,
+    lineHeight: 0,
+    fontSize: 0,
     background: "#F2F4F1",
-    color: "#5C6570",
-    fontStyle: "italic",
-    fontSize: 12,
-    padding: "6px 10px",
-    borderBottom: "1px solid #D7DBD5",
     borderTop: "1px solid #D7DBD5",
+    borderBottom: "1px solid #D7DBD5",
   },
 };
