@@ -721,13 +721,57 @@ export default function GraphicalTimetable() {
     return { count: best, atMin: bestT };
   }
 
-  // Fixed direction per track: 1 track is a single shared bidirectional resource (capacity
-  // applies to both directions combined, unchanged from before); 2+ tracks are split as evenly
-  // as possible between the two directions, "asc" (ascending id order) getting the extra one
-  // on an odd count. Arbitrary tie-break, but stable per section.
-  function splitTrackCapacity(raw) {
-    if (raw < 2) return { shared: true, ascCap: raw, descCap: raw };
-    return { shared: false, ascCap: Math.ceil(raw / 2), descCap: Math.floor(raw / 2) };
+  // Fixed direction per track, with an odd leftover track shared dynamically: floor(N/2) tracks
+  // are permanently dedicated to each direction, and if N is odd there's one "swing" track that
+  // either direction may use — it isn't reserved, so whichever direction needs it takes it, and
+  // it's free again as soon as that train clears the block. N=1 is the degenerate case (0
+  // dedicated each, everything through the swing track), which reduces to the original
+  // undirected single-track behavior.
+  //
+  // A conflict occurs at a moment in time when the combined overflow beyond each direction's own
+  // dedicated capacity exceeds what the swing track(s) can cover — one direction's spare
+  // dedicated capacity can never bail out the other, only the swing capacity is flexible:
+  //   excess(t) = max(0, ascCount(t) - dedicated) + max(0, descCount(t) - dedicated)
+  //   conflict when excess(t) > swing
+  function evaluateDirectionalCapacity(ascIvs, descIvs, dedicated, swing) {
+    const events = [];
+    const pushEvents = (ivs, dir) => {
+      for (const iv of ivs) {
+        if (iv.e - iv.s <= 1e-9) continue; // point intervals don't occupy the block
+        events.push({ t: iv.s, d: 1, dir });
+        events.push({ t: iv.e, d: -1, dir });
+      }
+    };
+    pushEvents(ascIvs, "asc");
+    pushEvents(descIvs, "desc");
+    if (events.length === 0) return { conflict: false, atMin: null, need: 0, windows: [] };
+    events.sort((a, b) => (a.t - b.t) || (a.d - b.d)); // ends before starts (half-open)
+    let curA = 0;
+    let curB = 0;
+    let bestExcess = 0;
+    let bestAtMin = null;
+    let bestNeed = 0;
+    const windows = [];
+    let openStart = null;
+    const excessOf = (a, b) => Math.max(0, a - dedicated) + Math.max(0, b - dedicated);
+    for (const e of events) {
+      const wasOver = excessOf(curA, curB) > swing;
+      if (e.dir === "asc") curA += e.d;
+      else curB += e.d;
+      const ex = excessOf(curA, curB);
+      if (ex > bestExcess) {
+        bestExcess = ex;
+        bestAtMin = e.t;
+        bestNeed = curA + curB;
+      }
+      const isOver = ex > swing;
+      if (!wasOver && isOver) openStart = e.t;
+      else if (wasOver && !isOver && openStart !== null) {
+        if (e.t > openStart + 1e-9) windows.push([openStart, e.t]);
+        openStart = null;
+      }
+    }
+    return { conflict: bestExcess > swing, atMin: bestAtMin, need: bestNeed, windows };
   }
 
   // Wie maxOverlap, aber mit halboffenen Intervallen [start, end): eine reine Berührung am Rand
@@ -910,25 +954,38 @@ export default function GraphicalTimetable() {
       }
       const nameA = stationsById.get(idA)?.name || idA;
       const nameB = stationsById.get(idB)?.name || idB;
-      const { shared, ascCap, descCap } = splitTrackCapacity(raw);
+      const dedicated = Math.floor(raw / 2);
+      const swing = raw - dedicated * 2; // 0 or 1 — see evaluateDirectionalCapacity
       const winsForKey = {};
-      // shared: one physical track, so both directions draw from the same single pool (this is
-      // also what capacity 1 has always meant here). 2+ tracks: fixed direction per track, so
-      // "asc" and "desc" travel get their own independent capacity and are checked separately —
-      // a same-direction pile-up still conflicts even though the section overall isn't "full".
-      const checkDir = (dirIvs, cap, dirLabel) => {
-        const { count, atMin } = maxOverlapHalfOpen(dirIvs);
-        if (count <= cap) return;
-        sectionConflicts.push({ key, nameA, nameB, need: count, have: cap, atMin, dir: dirLabel });
-        const wins = overCapacityWindows(dirIvs, cap, 0, true);
-        if (wins.length) winsForKey[dirLabel] = wins;
-      };
-      if (shared) {
-        checkDir(ivs, raw, "asc");
-        if (winsForKey.asc) winsForKey.desc = winsForKey.asc;
+      if (swing === 0) {
+        // No shared track: each direction's capacity is fully independent, so check (and
+        // highlight) them separately — a same-direction pile-up still conflicts even though
+        // the section overall isn't "full", and the other direction is never implicated.
+        const checkDir = (dirIvs, cap, dirLabel) => {
+          const { count, atMin } = maxOverlapHalfOpen(dirIvs);
+          if (count <= cap) return;
+          sectionConflicts.push({ key, nameA, nameB, need: count, have: cap, atMin, dir: dirLabel });
+          const wins = overCapacityWindows(dirIvs, cap, 0, true);
+          if (wins.length) winsForKey[dirLabel] = wins;
+        };
+        checkDir(ivs.filter((iv) => iv.dir === "asc"), dedicated, "asc");
+        checkDir(ivs.filter((iv) => iv.dir === "desc"), dedicated, "desc");
       } else {
-        checkDir(ivs.filter((iv) => iv.dir === "asc"), ascCap, "asc");
-        checkDir(ivs.filter((iv) => iv.dir === "desc"), descCap, "desc");
+        const r = evaluateDirectionalCapacity(
+          ivs.filter((iv) => iv.dir === "asc"),
+          ivs.filter((iv) => iv.dir === "desc"),
+          dedicated,
+          swing
+        );
+        if (r.conflict) {
+          sectionConflicts.push({ key, nameA, nameB, need: r.need, have: raw, atMin: r.atMin, dir: "shared" });
+          // Which direction the swing track was needed by can shift moment to moment within
+          // the same window, so both directions' trips through it are flagged together.
+          if (r.windows.length) {
+            winsForKey.asc = r.windows;
+            winsForKey.desc = r.windows;
+          }
+        }
       }
       if (winsForKey.asc || winsForKey.desc) sectionWindows.set(key, winsForKey);
     }
