@@ -24,7 +24,7 @@ import {
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.8.1";
+const APP_VERSION = "1.8.2";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -335,10 +335,9 @@ const TRANSLATIONS = {
     exportNoRange: "Mindestens eine Linie aktivieren und Start-/Zielstation wählen.",
     exportWindowFrom: "Zeitraum von",
     exportWindowTo: "bis",
-    exportStationsTitle: "Abfahrtszeit anzeigen:",
-    exportShowArrival: "Ankunft zusätzlich anzeigen",
     exportNoTrains: "Keine Fahrten im gewählten Zeitraum auf diesem Abschnitt.",
     exportColStation: "Station",
+    exportColArrival: "Ank.",
     exportSavePdf: "Als PDF speichern",
     exportGenerating: "PDF wird erstellt…",
     exportGeneratedAt: "Erstellt am {date}",
@@ -546,10 +545,9 @@ const TRANSLATIONS = {
     exportNoRange: "Enable at least one line and pick its start/end stations.",
     exportWindowFrom: "Time range from",
     exportWindowTo: "to",
-    exportStationsTitle: "Show departure time:",
-    exportShowArrival: "Also show arrival",
     exportNoTrains: "No services run through this section in the selected time range.",
     exportColStation: "Station",
+    exportColArrival: "Arr.",
     exportSavePdf: "Save as PDF",
     exportGenerating: "Generating PDF…",
     exportGeneratedAt: "Generated on {date}",
@@ -639,10 +637,8 @@ export default function GraphicalTimetable() {
   const [stationSpacing, setStationSpacing] = useState(72);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [kurseMenuOpen, setKurseMenuOpen] = useState(false);
-  const [exportStationsMenuOpen, setExportStationsMenuOpen] = useState(false);
   const langMenuRef = useRef(null);
   const kurseMenuRef = useRef(null);
-  const exportStationsMenuRef = useRef(null);
   const fileInputRef = useRef(null);
   const loadFileInputRef = useRef(null);
   const diagramWrapRef = useRef(null);
@@ -1521,7 +1517,6 @@ export default function GraphicalTimetable() {
   // instead of instantly reopening.
   useDropdownClose(langMenuOpen, setLangMenuOpen, langMenuRef);
   useDropdownClose(kurseMenuOpen, setKurseMenuOpen, kurseMenuRef);
-  useDropdownClose(exportStationsMenuOpen, setExportStationsMenuOpen, exportStationsMenuRef);
 
   const NICE_MINUTE_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
   const TARGET_GRID_PX = 36;
@@ -4087,76 +4082,6 @@ export default function GraphicalTimetable() {
             <p style={{ color: "#5C6570", fontSize: 13, marginTop: 12 }}>{t("exportNoRange")}</p>
           ) : (
             <>
-              <div style={{ marginTop: 16, marginBottom: 18 }}>
-                {(() => {
-                  // Dedupe by station id — a branch's echoed junction row is the same station as
-                  // its main-line row, and the checkbox (keyed by station id) controls both at once.
-                  const seenStationIds = new Set();
-                  const allExportRows = exportBlocks
-                    .flatMap((b) => b.rows)
-                    .filter((r) => (seenStationIds.has(r.id) ? false : (seenStationIds.add(r.id), true)));
-                  const checkedCount = allExportRows.filter((r) => exportShowArrival[r.id]).length;
-                  return (
-                    <div ref={exportStationsMenuRef} style={styles.kurseMenuWrap}>
-                      <button
-                        onClick={() => setExportStationsMenuOpen((o) => !o)}
-                        style={styles.kurseMenuTrigger}
-                        aria-haspopup="true"
-                        aria-expanded={exportStationsMenuOpen}
-                      >
-                        <span>{t("exportStationsTitle")}</span>
-                        <span style={styles.kurseMenuCount} className="mono">
-                          {checkedCount}/{allExportRows.length}
-                        </span>
-                        <span style={styles.dropdownCaret}>▾</span>
-                      </button>
-                      {exportStationsMenuOpen && (
-                        <div style={styles.kurseMenu}>
-                          <div style={styles.kurseMenuActions}>
-                            <button
-                              type="button"
-                              className="ghost-btn"
-                              style={styles.kurseMenuActionBtn}
-                              onClick={() =>
-                                setExportShowArrival(Object.fromEntries(allExportRows.map((r) => [r.id, true])))
-                              }
-                            >
-                              {t("kurseShowAll")}
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost-btn"
-                              style={styles.kurseMenuActionBtn}
-                              onClick={() =>
-                                setExportShowArrival(Object.fromEntries(allExportRows.map((r) => [r.id, false])))
-                              }
-                            >
-                              {t("kurseHideAll")}
-                            </button>
-                          </div>
-                          <div style={styles.legend}>
-                            {allExportRows.map((r) => (
-                              <label key={r.id} style={styles.legendItem}>
-                                <input
-                                  type="checkbox"
-                                  checked={!!exportShowArrival[r.id]}
-                                  onChange={(e) =>
-                                    setExportShowArrival((prev) => ({ ...prev, [r.id]: e.target.checked }))
-                                  }
-                                />
-                                <span className="mono" style={{ fontSize: 12.5, whiteSpace: "nowrap" }}>
-                                  {stationsById.get(r.id)?.name}
-                                </span>
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-
               <p style={{ fontSize: 13, fontWeight: 500, margin: "16px 0 8px" }}>
                 {t("exportPreviewTitle")} — {exportLineSummary(exportBlocks)}
                 {" · "}
@@ -4170,6 +4095,7 @@ export default function GraphicalTimetable() {
                   <table style={styles.exportTable}>
                     <thead>
                       <tr>
+                        <th style={styles.exportArrivalHeaderCell}>{t("exportColArrival")}</th>
                         <th style={styles.exportStationHeaderCell}>{t("exportColStation")}</th>
                         <th style={styles.exportLabelHeaderCell}></th>
                         {exportColumns.map((c) => (
@@ -4184,13 +4110,30 @@ export default function GraphicalTimetable() {
                         if (row.type === "divider") {
                           return (
                             <tr key={`div-${ri}`}>
-                              <td colSpan={2 + exportColumns.length} style={styles.exportDividerCell} />
+                              <td colSpan={3 + exportColumns.length} style={styles.exportDividerCell} />
                             </tr>
                           );
                         }
                         const st = stationsById.get(row.stationId);
                         return (
                           <tr key={`${row.stationId}-${row.type}-${ri}`}>
+                            {row.type !== "ab" && (
+                              <td
+                                rowSpan={row.type === "an" ? 2 : 1}
+                                style={{
+                                  ...styles.exportArrivalCell,
+                                  ...(row.echo ? styles.exportEchoCell : {}),
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={!!exportShowArrival[row.stationId]}
+                                  onChange={(e) =>
+                                    setExportShowArrival((prev) => ({ ...prev, [row.stationId]: e.target.checked }))
+                                  }
+                                />
+                              </td>
+                            )}
                             {row.type !== "ab" && (
                               <td
                                 rowSpan={row.type === "an" ? 2 : 1}
@@ -5656,9 +5599,21 @@ const styles = {
     borderCollapse: "collapse",
     fontSize: 12,
   },
-  exportStationHeaderCell: {
+  exportArrivalHeaderCell: {
     position: "sticky",
     left: 0,
+    top: 0,
+    zIndex: 3,
+    background: "#171B1F",
+    color: "#F2F4F1",
+    padding: "7px 6px",
+    textAlign: "center",
+    minWidth: 40,
+    borderBottom: "1px solid #171B1F",
+  },
+  exportStationHeaderCell: {
+    position: "sticky",
+    left: 40,
     top: 0,
     zIndex: 3,
     background: "#171B1F",
@@ -5670,7 +5625,7 @@ const styles = {
   },
   exportLabelHeaderCell: {
     position: "sticky",
-    left: 160,
+    left: 200,
     top: 0,
     zIndex: 3,
     background: "#171B1F",
@@ -5688,9 +5643,19 @@ const styles = {
     whiteSpace: "nowrap",
     borderBottom: "1px solid #171B1F",
   },
-  exportStationCell: {
+  exportArrivalCell: {
     position: "sticky",
     left: 0,
+    zIndex: 1,
+    background: "#fff",
+    padding: "5px 6px",
+    textAlign: "center",
+    borderBottom: "1px solid #D7DBD5",
+    borderRight: "1px solid #D7DBD5",
+  },
+  exportStationCell: {
+    position: "sticky",
+    left: 40,
     zIndex: 1,
     background: "#fff",
     padding: "5px 10px",
@@ -5706,7 +5671,7 @@ const styles = {
   },
   exportLabelCell: {
     position: "sticky",
-    left: 160,
+    left: 200,
     zIndex: 1,
     background: "#fff",
     padding: "5px 4px",
