@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.5.1";
+const APP_VERSION = "1.6.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -198,6 +198,10 @@ const TRANSLATIONS = {
     branchesDesc: "Ein Zweig zweigt an einer Station der Hauptstrecke ab. Die Abzweigstation selbst wird automatisch als erste Station im Zweig mit angezeigt.",
     branchNamePlaceholder: "Zweigname",
     branchesFrom: "zweigt ab bei",
+    branchJoinsAt: "mündet ein bei",
+    branchDirectionAfter: "→ Zweig (danach)",
+    branchDirectionBefore: "← Zulauf (davor)",
+    branchDirectionToggleHint: "Richtung umschalten: Zweig danach/davor",
     removeBranch: "✕ Zweig entfernen",
     addStationToBranch: '+ Station zu "{name}" hinzufügen',
     addBranch: "+ Zweig hinzufügen",
@@ -371,6 +375,10 @@ const TRANSLATIONS = {
     branchesDesc: "A branch splits off from a station on the main line. The junction station itself is automatically shown as the first station of the branch too.",
     branchNamePlaceholder: "Branch name",
     branchesFrom: "branches off at",
+    branchJoinsAt: "joins at",
+    branchDirectionAfter: "→ Branch (after)",
+    branchDirectionBefore: "← Feeder (before)",
+    branchDirectionToggleHint: "Switch direction: branch after/before main",
     removeBranch: "✕ Remove branch",
     addStationToBranch: '+ Add station to "{name}"',
     addBranch: "+ Add branch",
@@ -508,6 +516,9 @@ export default function GraphicalTimetable() {
   const [shiftInputs, setShiftInputs] = useState({});
   const [rangeInputs, setRangeInputs] = useState({});
   const [collapsedKurse, setCollapsedKurse] = useState({});
+  const [collapsedLines, setCollapsedLines] = useState({});
+  const [draggedBranchId, setDraggedBranchId] = useState(null);
+  const [dragOverBranchId, setDragOverBranchId] = useState(null);
   const [draggedStationId, setDraggedStationId] = useState(null);
   const [dragOverStationId, setDragOverStationId] = useState(null);
   const [draggedWaypoint, setDraggedWaypoint] = useState(null);
@@ -1082,16 +1093,22 @@ export default function GraphicalTimetable() {
   // Wie fracWithin, aber die Abzweigstation zählt für den Zweig immer als Km 0,
   // unabhängig von ihrer tatsächlichen Kilometrierung auf der Hauptstrecke.
   function fracWithinBranch(bp, st) {
+    let frac;
     if (yMode === "schematic") {
       const pos = bp.stations.findIndex((s) => s.id === st.id);
-      return bp.stations.length > 1 ? pos / (bp.stations.length - 1) : 0;
+      frac = bp.stations.length > 1 ? pos / (bp.stations.length - 1) : 0;
+    } else {
+      const effectiveKm = (s) => (bp.attach && s.id === bp.attach.id ? 0 : toKm(s.km));
+      const kms = bp.stations.map(effectiveKm);
+      const mn = Math.min(0, ...kms);
+      const mx = Math.max(0, ...kms);
+      const span = Math.max(mx - mn, 1);
+      frac = (effectiveKm(st) - mn) / span;
     }
-    const effectiveKm = (s) => (bp.attach && s.id === bp.attach.id ? 0 : toKm(s.km));
-    const kms = bp.stations.map(effectiveKm);
-    const mn = Math.min(0, ...kms);
-    const mx = Math.max(0, ...kms);
-    const span = Math.max(mx - mn, 1);
-    return (effectiveKm(st) - mn) / span;
+    // A "before" (mirrored) branch's own stations are stored/ordered exactly like a normal
+    // branch (attach first), but need to render as the mirror image — attach at the panel's
+    // right edge (touching main) instead of its left.
+    return bp.mirrored ? 1 - frac : frac;
   }
 
   let minTime = toMin(winStart);
@@ -1112,20 +1129,37 @@ export default function GraphicalTimetable() {
   const PANEL_GAP = 56;
   const mainCount = Math.max(mainStations.length, 2);
   const mainChartW = Math.max(220, (mainCount - 1) * stationSpacing);
-  const branchPanels = branches.map((br) => {
+  function makeBranchPanel(br) {
     const attach = stations.find((s) => s.id === br.fromStationId) || null;
     const ownStations = branchStationsMap.get(br.id) || [];
     const displayStations = attach ? [attach, ...ownStations] : ownStations;
     const count = Math.max(displayStations.length, 1);
     const w = Math.max(120, (count > 1 ? count - 1 : 1) * stationSpacing);
-    return { branch: br, stations: displayStations, ownStations, attach, width: w };
+    return { branch: br, stations: displayStations, ownStations, attach, width: w, mirrored: br.direction === "before" };
+  }
+  // "before" branches feed INTO the main line and render as their own panels to its left — the
+  // mirror image of the normal (diverging, "after") branches to its right. Left-to-right, the
+  // whole diagram reads as: before-branches in their configured order, then main, then
+  // after-branches in their configured order.
+  const beforeBranches = branches.filter((b) => b.direction === "before");
+  const afterBranches = branches.filter((b) => b.direction !== "before");
+  const beforePanels = beforeBranches.map(makeBranchPanel);
+  const afterPanels = afterBranches.map(makeBranchPanel);
+  const branchPanels = [...beforePanels, ...afterPanels];
+  let runningX = margin.left;
+  const beforePanelOffsets = beforePanels.map((bp) => {
+    const left = runningX;
+    runningX = left + bp.width + PANEL_GAP;
+    return left;
   });
-  let runningX = margin.left + mainChartW;
-  const branchPanelOffsets = branchPanels.map((bp) => {
+  const mainLeft = runningX;
+  runningX = mainLeft + mainChartW;
+  const afterPanelOffsets = afterPanels.map((bp) => {
     const left = runningX + PANEL_GAP;
     runningX = left + bp.width;
     return left;
   });
+  const branchPanelOffsets = [...beforePanelOffsets, ...afterPanelOffsets];
   const chartW = runningX - margin.left;
   const chartH = Math.max(240, timeSpan * pxPerMin);
   const svgW = margin.left + chartW + margin.right;
@@ -1135,16 +1169,17 @@ export default function GraphicalTimetable() {
     return margin.top + ((min - minTime) / timeSpan) * chartH;
   }
   function panelEdges(branchId) {
-    if (!branchId) return { left: margin.left, right: margin.left + mainChartW };
+    if (!branchId) return { left: mainLeft, right: mainLeft + mainChartW };
     const idx = branchPanels.findIndex((bp) => bp.branch.id === branchId);
-    if (idx === -1) return { left: margin.left, right: margin.left + mainChartW };
+    if (idx === -1) return { left: mainLeft, right: mainLeft + mainChartW };
     const left = branchPanelOffsets[idx];
     return { left, right: left + branchPanels[idx].width };
   }
+  // Effective horizontal position, for comparing which of two lines sits further right in the
+  // diagram — real panel X, not array order, since a "before" branch can sit earlier in the
+  // `branches` array while still rendering to the right of an "after" branch (or vice versa).
   function branchOrderIndex(branchId) {
-    if (!branchId) return 0;
-    const idx = branches.findIndex((b) => b.id === branchId);
-    return idx === -1 ? 0 : idx + 1;
+    return panelEdges(branchId).left;
   }
   function stubPath(x, y, direction) {
     const len = 14;
@@ -1162,11 +1197,11 @@ export default function GraphicalTimetable() {
   }
   function stationX(idx) {
     const st = sortedStations[idx];
-    if (!st) return margin.left;
+    if (!st) return mainLeft;
     const branchId = st.branchId || null;
     if (!branchId) {
       const frac = fracWithin(mainStations, st);
-      return margin.left + frac * mainChartW;
+      return mainLeft + frac * mainChartW;
     }
     const bpIdx = branchPanels.findIndex((bp) => bp.branch.id === branchId);
     if (bpIdx === -1) return margin.left;
@@ -1176,7 +1211,8 @@ export default function GraphicalTimetable() {
     const frac = fracWithinBranch(bp, st);
     return left + frac * bp.width;
   }
-  // x-Position der Abzweigstation innerhalb eines Zweig-Panels (immer ganz links, Position 0)
+  // x-Position der Abzweigstation innerhalb eines Zweig-Panels (links bei normalen, rechts bei
+  // gespiegelten/"before"-Zweigen — siehe fracWithinBranch)
   function branchAttachX(bp) {
     const left = branchPanelOffsets[branchPanels.indexOf(bp)];
     if (bp.stations.length <= 1) return left + bp.width / 2;
@@ -1443,23 +1479,27 @@ export default function GraphicalTimetable() {
   // station (signals are never rows).
   function buildExportBlocks() {
     const blocks = [];
-    if (exportMainEnabled && exportMainFromId && exportMainToId) {
-      const ids = sliceChain(mainStations, exportMainFromId, exportMainToId);
-      if (ids) blocks.push({ label: null, attachId: null, rows: ids.map((id) => ({ id, rowKey: `0:${id}` })) });
-    }
-    for (const br of branches) {
-      if (!exportBranchEnabled[br.id]) continue;
+    function pushBranchBlock(br) {
+      if (!exportBranchEnabled[br.id]) return;
       const fromId = exportBranchFromId[br.id];
       const toId = exportBranchToId[br.id];
-      if (!fromId || !toId) continue;
+      if (!fromId || !toId) return;
       const ids = sliceChain(chainFor(br.id), fromId, toId);
-      if (!ids) continue;
+      if (!ids) return;
       blocks.push({
         label: br.name,
         attachId: br.fromStationId,
         rows: ids.map((id) => ({ id, echo: id === br.fromStationId, rowKey: `${br.id}:${id}` })),
       });
     }
+    // Stacking order mirrors the diagram's left-to-right reading, top to bottom: "before"
+    // (feeder) branches first, then the main line, then "after" (diverging) branches.
+    for (const br of beforeBranches) pushBranchBlock(br);
+    if (exportMainEnabled && exportMainFromId && exportMainToId) {
+      const ids = sliceChain(mainStations, exportMainFromId, exportMainToId);
+      if (ids) blocks.push({ label: null, attachId: null, rows: ids.map((id) => ({ id, rowKey: `0:${id}` })) });
+    }
+    for (const br of afterBranches) pushBranchBlock(br);
     return blocks.length ? blocks : null;
   }
 
@@ -2023,7 +2063,7 @@ export default function GraphicalTimetable() {
   function addBranch() {
     const id = uid();
     const fromStationId = mainStations[0] ? mainStations[0].id : "";
-    setBranches((prev) => [...prev, { id, name: `Zweig ${prev.length + 1}`, fromStationId }]);
+    setBranches((prev) => [...prev, { id, name: `Zweig ${prev.length + 1}`, fromStationId, direction: "after" }]);
   }
   function updateBranch(id, field, value) {
     setBranches((prev) => prev.map((b) => (b.id === id ? { ...b, [field]: value } : b)));
@@ -2031,6 +2071,31 @@ export default function GraphicalTimetable() {
   function removeBranch(id) {
     setBranches((prev) => prev.filter((b) => b.id !== id));
     setStations((prev) => prev.map((s) => (s.branchId === id ? { ...s, branchId: null } : s)));
+  }
+  // Drag-reorders a branch among its own side only ("before" branches among themselves, "after"
+  // among themselves) — this order drives both the diagram's left-to-right panel order and the
+  // timetable exporter's top-to-bottom block stacking.
+  function reorderBranches(draggedId, targetId) {
+    if (!draggedId || draggedId === targetId) return;
+    setBranches((prev) => {
+      const draggedBr = prev.find((b) => b.id === draggedId);
+      const targetBr = prev.find((b) => b.id === targetId);
+      if (!draggedBr || !targetBr) return prev;
+      const dir = draggedBr.direction === "before" ? "before" : "after";
+      if ((targetBr.direction === "before" ? "before" : "after") !== dir) return prev;
+      const group = prev.filter((b) => (b.direction === "before" ? "before" : "after") === dir);
+      const fromIdx = group.findIndex((b) => b.id === draggedId);
+      const toIdx = group.findIndex((b) => b.id === targetId);
+      if (fromIdx === -1 || toIdx === -1) return prev;
+      const newGroup = [...group];
+      const [moved] = newGroup.splice(fromIdx, 1);
+      newGroup.splice(toIdx, 0, moved);
+      let gi = 0;
+      return prev.map((b) => ((b.direction === "before" ? "before" : "after") === dir ? newGroup[gi++] : b));
+    });
+  }
+  function toggleLineCollapsed(key) {
+    setCollapsedLines((prev) => ({ ...prev, [key]: !prev[key] }));
   }
   function addVehicle() {
     const id = uid();
@@ -2630,6 +2695,347 @@ export default function GraphicalTimetable() {
     );
   }
 
+  function renderExportBranchRow(br) {
+    const chain = chainFor(br.id).filter((s) => s.kind !== "signal");
+    const enabled = !!exportBranchEnabled[br.id];
+    return (
+      <div key={br.id} style={styles.exportLineRow}>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) =>
+            setExportBranchEnabled((prev) => ({ ...prev, [br.id]: e.target.checked }))
+          }
+        />
+        <span style={styles.exportLineName}>{br.name}</span>
+        <select
+          value={exportBranchFromId[br.id] || ""}
+          onChange={(e) =>
+            setExportBranchFromId((prev) => ({ ...prev, [br.id]: e.target.value }))
+          }
+          disabled={!enabled}
+        >
+          <option value="">—</option>
+          {chain.map((s) => (
+            <option key={s.id} value={s.id}>{s.name}</option>
+          ))}
+        </select>
+        <span style={styles.exportLineToLabel}>{t("rangeTo")}</span>
+        <select
+          value={exportBranchToId[br.id] || ""}
+          onChange={(e) =>
+            setExportBranchToId((prev) => ({ ...prev, [br.id]: e.target.value }))
+          }
+          disabled={!enabled}
+        >
+          <option value="">—</option>
+          {chain.map((s) => (
+            <option key={s.id} value={s.id}>{s.name}</option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
+  function renderBranchBlock(br) {
+    const bStations = branchStationsMap.get(br.id) || [];
+    const attachStation = mainStations.find((s) => s.id === br.fromStationId);
+    const isMirrored = br.direction === "before";
+    const isCollapsed = !!collapsedLines[br.id];
+    return (
+      <div
+        key={br.id}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (dragOverBranchId !== br.id) setDragOverBranchId(br.id);
+        }}
+        onDragLeave={() => {
+          setDragOverBranchId((prev) => (prev === br.id ? null : prev));
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          reorderBranches(draggedBranchId, br.id);
+          setDraggedBranchId(null);
+          setDragOverBranchId(null);
+        }}
+        style={{
+          marginBottom: 20,
+          paddingBottom: 16,
+          borderBottom: "1px solid #D7DBD5",
+          opacity: draggedBranchId === br.id ? 0.4 : 1,
+          borderTop: dragOverBranchId === br.id && draggedBranchId !== br.id ? "2px solid #9C7A2E" : undefined,
+        }}
+      >
+        <div style={styles.rangeRow}>
+          <button
+            onClick={() => toggleLineCollapsed(br.id)}
+            style={styles.chevronBtn}
+            aria-label={isCollapsed ? t("expandKurs") : t("collapseKurs")}
+          >
+            {isCollapsed ? "▸" : "▾"}
+          </button>
+          <span
+            draggable
+            onDragStart={(e) => {
+              setDraggedBranchId(br.id);
+              e.dataTransfer.effectAllowed = "move";
+            }}
+            onDragEnd={() => {
+              setDraggedBranchId(null);
+              setDragOverBranchId(null);
+            }}
+            style={styles.dragHandle}
+            aria-label={t("dragHandle")}
+            title={t("dragHandle")}
+          >
+            ⠿
+          </span>
+          <input
+            type="text"
+            value={br.name}
+            onChange={(e) => updateBranch(br.id, "name", e.target.value)}
+            style={{ width: 140, fontWeight: 600 }}
+            placeholder={t("branchNamePlaceholder")}
+          />
+          <button
+            onClick={() => updateBranch(br.id, "direction", isMirrored ? "after" : "before")}
+            style={styles.addBtnSmall}
+            title={t("branchDirectionToggleHint")}
+          >
+            {isMirrored ? t("branchDirectionBefore") : t("branchDirectionAfter")}
+          </button>
+          <span style={{ fontSize: 12, color: "#848C82" }}>{isMirrored ? t("branchJoinsAt") : t("branchesFrom")}</span>
+          <select
+            value={br.fromStationId}
+            onChange={(e) => updateBranch(br.id, "fromStationId", e.target.value)}
+          >
+            {mainStations.map((st) => (
+              <option key={st.id} value={st.id}>{st.name}</option>
+            ))}
+          </select>
+          <button onClick={() => removeBranch(br.id)} style={styles.iconBtn} aria-label={t("removeBranch")}>
+            {t("removeBranch")}
+          </button>
+        </div>
+        {!isCollapsed && (
+          <>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 4 }}>
+          <div style={{ overflowX: "auto", flex: 1 }}>
+          <table className="station-table" style={{ minWidth: 880 }}>
+            <thead>
+              <tr>
+                <th style={{ width: 70 }}></th>
+                <th style={{ width: 220 }}>{t("colName")}</th>
+                <th style={{ width: 110 }}>{t("colKm")}</th>
+                <th style={{ width: 90 }}>{t("colDistance")}</th>
+                <th style={{ width: 100 }}>{t("colMaxSpeed")}</th>
+                <th style={{ width: 90 }}>{t("colStationTracks")}</th>
+                <th style={{ width: 90 }}>{t("colTracks")}</th>
+                <th style={{ width: 120 }}>{t("colDwell")}</th>
+                <th style={{ width: 40 }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {(() => {
+                return attachStation ? (
+                  <tr style={{ background: "#F2F4F1" }}>
+                    <td></td>
+                    <td style={{ color: "#848C82" }}>{attachStation.name} ⑂</td>
+                    <td>
+                      <input
+                        type="text"
+                        value="0"
+                        disabled
+                        style={{ width: 90, background: "#E9ECE7", color: "#848C82" }}
+                      />
+                    </td>
+                    <td className="mono" style={{ color: "#848C82", fontSize: 12 }}>{t("distanceFirst")}</td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                  </tr>
+                ) : null;
+              })()}
+              {bStations.map((st, idx) => {
+                const isSignal = st.kind === "signal";
+                return (
+                <tr
+                  key={st.id}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    if (dragOverStationId !== st.id) setDragOverStationId(st.id);
+                  }}
+                  onDragLeave={() => {
+                    setDragOverStationId((prev) => (prev === st.id ? null : prev));
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    reorderStations(draggedStationId, st.id);
+                    setDraggedStationId(null);
+                    setDragOverStationId(null);
+                  }}
+                  style={{
+                    opacity: draggedStationId === st.id ? 0.4 : 1,
+                    background: isSignal ? "#F5F1E8" : undefined,
+                    borderTop: dragOverStationId === st.id && draggedStationId !== st.id ? "2px solid #9C7A2E" : undefined,
+                  }}
+                >
+                  <td>
+                    <span
+                      draggable
+                      onDragStart={(e) => {
+                        setDraggedStationId(st.id);
+                        e.dataTransfer.effectAllowed = "move";
+                      }}
+                      onDragEnd={() => {
+                        setDraggedStationId(null);
+                        setDragOverStationId(null);
+                      }}
+                      style={styles.dragHandle}
+                      aria-label={t("dragHandle")}
+                      title={t("dragHandle")}
+                    >
+                      ⠿
+                    </span>
+                  </td>
+                  <td>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="text"
+                        value={st.name}
+                        onChange={(e) => updateStation(st.id, "name", e.target.value)}
+                        style={{ width: "100%" }}
+                      />
+                      {isSignal && <span style={styles.signalBadge}>{t("signalBadge")}</span>}
+                    </div>
+                  </td>
+                  <td>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={st.km}
+                      onChange={(e) => updateStation(st.id, "km", e.target.value)}
+                      style={{ width: 90 }}
+                      placeholder={t("kmOptional")}
+                    />
+                  </td>
+                  <td className="mono" style={{ color: "#848C82", fontSize: 12 }}>
+                    {(() => {
+                      const cur = kmOrNull(st.km);
+                      const prev = idx === 0 ? 0 : kmOrNull(bStations[idx - 1].km);
+                      if (cur === null || prev === null) return t("distanceFirst");
+                      const d = cur - prev;
+                      return `${d < 0 ? "⚠ " : ""}${d.toFixed(2)} km`;
+                    })()}
+                  </td>
+                  <td>
+                    {(() => {
+                      const prevId = idx === 0 ? (attachStation && attachStation.id) : bStations[idx - 1].id;
+                      if (!prevId) return null;
+                      const key = segKey(prevId, st.id);
+                      return (
+                        <input
+                          type="number"
+                          step="1"
+                          min="0"
+                          value={maxSpeeds[key] ?? ""}
+                          onChange={(e) => setMaxSpeeds((prev) => ({ ...prev, [key]: e.target.value }))}
+                          style={{ width: 80 }}
+                          placeholder="km/h"
+                        />
+                      );
+                    })()}
+                  </td>
+                  <td>
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={st.stationTracks ?? ""}
+                        onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
+                        style={{ width: 60 }}
+                        placeholder="—"
+                      />
+                    )}
+                  </td>
+                  <td>
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (() => {
+                      const chain = attachStation ? [attachStation, ...bStations] : bStations;
+                      const prevId = prevRealId(chain, attachStation ? idx + 1 : idx);
+                      if (!prevId) return null;
+                      const key = segKey(prevId, st.id);
+                      return (
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={trackCounts[key] ?? ""}
+                          onChange={(e) => setTrackCounts((prev) => ({ ...prev, [key]: e.target.value }))}
+                          style={{ width: 60 }}
+                          placeholder="—"
+                        />
+                      );
+                    })()}
+                  </td>
+                  <td>
+                    {isSignal ? (
+                      <span style={{ color: "#848C82" }}>—</span>
+                    ) : (
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={st.dwell ?? ""}
+                        onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
+                        style={{ width: 90 }}
+                        placeholder="MM:SS"
+                      />
+                    )}
+                  </td>
+                  <td>
+                    <button
+                      onClick={() => removeStation(st.id)}
+                      style={styles.iconBtn}
+                      aria-label={isSignal ? t("removeSignal") : t("removeStation")}
+                    >
+                      ✕
+                    </button>
+                  </td>
+                </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          </div>
+          {(() => {
+            const bandStations = attachStation ? [attachStation, ...bStations] : bStations;
+            return bandStations.length > 0 ? (
+              <div style={{ paddingTop: 25 }} title={t("routeBandTitle")}>
+                <RouteBand stationList={bandStations} />
+              </div>
+            ) : null;
+          })()}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={() => addStationToBranch(br.id)} style={styles.addBtn}>
+              {t("addStationToBranch", { name: br.name })}
+            </button>
+            <button onClick={() => addSignalToBranch(br.id)} style={styles.addBtn} title={t("signalHint")}>
+              {t("addSignalToBranch", { name: br.name })}
+            </button>
+          </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div style={styles.app}>
       <style>{`
@@ -2902,6 +3308,17 @@ export default function GraphicalTimetable() {
                     {branchFromIds.has(st.id) ? " ⑂" : ""}
                   </text>
                 ))}
+                {beforePanels.length > 0 && (
+                  <line
+                    x1={mainLeft - PANEL_GAP / 2}
+                    y1={0}
+                    x2={mainLeft - PANEL_GAP / 2}
+                    y2={HEADER_HEIGHT - TRACK_BAND_H}
+                    stroke="#D7DBD5"
+                    strokeWidth={1}
+                    strokeDasharray="3 3"
+                  />
+                )}
                 {branchPanels.map((bp, i) => (
                   <g key={bp.branch.id}>
                     <line
@@ -2921,7 +3338,7 @@ export default function GraphicalTimetable() {
                       fontWeight="600"
                       fill="#5C6570"
                     >
-                      → {bp.branch.name}
+                      {bp.mirrored ? "← " : "→ "}{bp.branch.name}
                     </text>
                     {bp.attach && (
                       <text
@@ -2976,6 +3393,17 @@ export default function GraphicalTimetable() {
                 );
               })}
 
+              {beforePanels.length > 0 && (
+                <line
+                  x1={mainLeft - PANEL_GAP / 2}
+                  y1={margin.top}
+                  x2={mainLeft - PANEL_GAP / 2}
+                  y2={margin.top + chartH}
+                  stroke="#D7DBD5"
+                  strokeWidth={1}
+                  strokeDasharray="3 3"
+                />
+              )}
               {branchPanels.map((bp, i) => (
                 <line
                   key={bp.branch.id}
@@ -3331,6 +3759,7 @@ export default function GraphicalTimetable() {
           </div>
 
           <div style={styles.exportLinesList}>
+            {beforeBranches.map(renderExportBranchRow)}
             <div style={styles.exportLineRow}>
               <input
                 type="checkbox"
@@ -3360,47 +3789,7 @@ export default function GraphicalTimetable() {
                 ))}
               </select>
             </div>
-            {branches.map((br) => {
-              const chain = chainFor(br.id).filter((s) => s.kind !== "signal");
-              const enabled = !!exportBranchEnabled[br.id];
-              return (
-                <div key={br.id} style={styles.exportLineRow}>
-                  <input
-                    type="checkbox"
-                    checked={enabled}
-                    onChange={(e) =>
-                      setExportBranchEnabled((prev) => ({ ...prev, [br.id]: e.target.checked }))
-                    }
-                  />
-                  <span style={styles.exportLineName}>{br.name}</span>
-                  <select
-                    value={exportBranchFromId[br.id] || ""}
-                    onChange={(e) =>
-                      setExportBranchFromId((prev) => ({ ...prev, [br.id]: e.target.value }))
-                    }
-                    disabled={!enabled}
-                  >
-                    <option value="">—</option>
-                    {chain.map((s) => (
-                      <option key={s.id} value={s.id}>{s.name}</option>
-                    ))}
-                  </select>
-                  <span style={styles.exportLineToLabel}>{t("rangeTo")}</span>
-                  <select
-                    value={exportBranchToId[br.id] || ""}
-                    onChange={(e) =>
-                      setExportBranchToId((prev) => ({ ...prev, [br.id]: e.target.value }))
-                    }
-                    disabled={!enabled}
-                  >
-                    <option value="">—</option>
-                    {chain.map((s) => (
-                      <option key={s.id} value={s.id}>{s.name}</option>
-                    ))}
-                  </select>
-                </div>
-              );
-            })}
+            {afterBranches.map(renderExportBranchRow)}
           </div>
 
           {!exportBlocks ? (
@@ -3554,7 +3943,20 @@ export default function GraphicalTimetable() {
 
       {tab === "stations" && (
         <div style={{ ...styles.panel, maxWidth: 1280 }}>
-          <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("mainStrecke")}</p>
+          {beforeBranches.map(renderBranchBlock)}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 6, margin: "0 0 8px" }}>
+            <button
+              onClick={() => toggleLineCollapsed("main")}
+              style={styles.chevronBtn}
+              aria-label={collapsedLines.main ? t("expandKurs") : t("collapseKurs")}
+            >
+              {collapsedLines.main ? "▸" : "▾"}
+            </button>
+            <p style={{ fontSize: 13, fontWeight: 500, margin: 0 }}>{t("mainStrecke")}</p>
+          </div>
+          {!collapsedLines.main && (
+          <>
           <div style={{ display: "flex", alignItems: "flex-start", gap: 4 }}>
           <div style={{ overflowX: "auto", flex: 1 }}>
           <table className="station-table" style={{ minWidth: 880 }}>
@@ -3735,249 +4137,11 @@ export default function GraphicalTimetable() {
             <button onClick={addStation} style={styles.addBtn}>{t("addStation")}</button>
             <button onClick={addSignal} style={styles.addBtn} title={t("signalHint")}>{t("addSignal")}</button>
           </div>
+          </>
+          )}
 
           <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #D7DBD5" }}>
-            <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 4px" }}>{t("branchesTitle")}</p>
-            {branches.map((br) => {
-              const bStations = branchStationsMap.get(br.id) || [];
-              const attachStation = mainStations.find((s) => s.id === br.fromStationId);
-              return (
-                <div key={br.id} style={{ marginBottom: 20, paddingBottom: 16, borderBottom: "1px solid #D7DBD5" }}>
-                  <div style={styles.rangeRow}>
-                    <input
-                      type="text"
-                      value={br.name}
-                      onChange={(e) => updateBranch(br.id, "name", e.target.value)}
-                      style={{ width: 140, fontWeight: 600 }}
-                      placeholder={t("branchNamePlaceholder")}
-                    />
-                    <span style={{ fontSize: 12, color: "#848C82" }}>{t("branchesFrom")}</span>
-                    <select
-                      value={br.fromStationId}
-                      onChange={(e) => updateBranch(br.id, "fromStationId", e.target.value)}
-                    >
-                      {mainStations.map((st) => (
-                        <option key={st.id} value={st.id}>{st.name}</option>
-                      ))}
-                    </select>
-                    <button onClick={() => removeBranch(br.id)} style={styles.iconBtn} aria-label={t("removeBranch")}>
-                      {t("removeBranch")}
-                    </button>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "flex-start", gap: 4 }}>
-                  <div style={{ overflowX: "auto", flex: 1 }}>
-                  <table className="station-table" style={{ minWidth: 880 }}>
-                    <thead>
-                      <tr>
-                        <th style={{ width: 70 }}></th>
-                        <th style={{ width: 220 }}>{t("colName")}</th>
-                        <th style={{ width: 110 }}>{t("colKm")}</th>
-                        <th style={{ width: 90 }}>{t("colDistance")}</th>
-                        <th style={{ width: 100 }}>{t("colMaxSpeed")}</th>
-                        <th style={{ width: 90 }}>{t("colStationTracks")}</th>
-                        <th style={{ width: 90 }}>{t("colTracks")}</th>
-                        <th style={{ width: 120 }}>{t("colDwell")}</th>
-                        <th style={{ width: 40 }}></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(() => {
-                        return attachStation ? (
-                          <tr style={{ background: "#F2F4F1" }}>
-                            <td></td>
-                            <td style={{ color: "#848C82" }}>{attachStation.name} ⑂</td>
-                            <td>
-                              <input
-                                type="text"
-                                value="0"
-                                disabled
-                                style={{ width: 90, background: "#E9ECE7", color: "#848C82" }}
-                              />
-                            </td>
-                            <td className="mono" style={{ color: "#848C82", fontSize: 12 }}>{t("distanceFirst")}</td>
-                            <td></td>
-                            <td></td>
-                            <td></td>
-                            <td></td>
-                            <td></td>
-                          </tr>
-                        ) : null;
-                      })()}
-                      {bStations.map((st, idx) => {
-                        const isSignal = st.kind === "signal";
-                        return (
-                        <tr
-                          key={st.id}
-                          onDragOver={(e) => {
-                            e.preventDefault();
-                            if (dragOverStationId !== st.id) setDragOverStationId(st.id);
-                          }}
-                          onDragLeave={() => {
-                            setDragOverStationId((prev) => (prev === st.id ? null : prev));
-                          }}
-                          onDrop={(e) => {
-                            e.preventDefault();
-                            reorderStations(draggedStationId, st.id);
-                            setDraggedStationId(null);
-                            setDragOverStationId(null);
-                          }}
-                          style={{
-                            opacity: draggedStationId === st.id ? 0.4 : 1,
-                            background: isSignal ? "#F5F1E8" : undefined,
-                            borderTop: dragOverStationId === st.id && draggedStationId !== st.id ? "2px solid #9C7A2E" : undefined,
-                          }}
-                        >
-                          <td>
-                            <span
-                              draggable
-                              onDragStart={(e) => {
-                                setDraggedStationId(st.id);
-                                e.dataTransfer.effectAllowed = "move";
-                              }}
-                              onDragEnd={() => {
-                                setDraggedStationId(null);
-                                setDragOverStationId(null);
-                              }}
-                              style={styles.dragHandle}
-                              aria-label={t("dragHandle")}
-                              title={t("dragHandle")}
-                            >
-                              ⠿
-                            </span>
-                          </td>
-                          <td>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                              <input
-                                type="text"
-                                value={st.name}
-                                onChange={(e) => updateStation(st.id, "name", e.target.value)}
-                                style={{ width: "100%" }}
-                              />
-                              {isSignal && <span style={styles.signalBadge}>{t("signalBadge")}</span>}
-                            </div>
-                          </td>
-                          <td>
-                            <input
-                              type="text"
-                              inputMode="decimal"
-                              value={st.km}
-                              onChange={(e) => updateStation(st.id, "km", e.target.value)}
-                              style={{ width: 90 }}
-                              placeholder={t("kmOptional")}
-                            />
-                          </td>
-                          <td className="mono" style={{ color: "#848C82", fontSize: 12 }}>
-                            {(() => {
-                              const cur = kmOrNull(st.km);
-                              const prev = idx === 0 ? 0 : kmOrNull(bStations[idx - 1].km);
-                              if (cur === null || prev === null) return t("distanceFirst");
-                              const d = cur - prev;
-                              return `${d < 0 ? "⚠ " : ""}${d.toFixed(2)} km`;
-                            })()}
-                          </td>
-                          <td>
-                            {(() => {
-                              const prevId = idx === 0 ? (attachStation && attachStation.id) : bStations[idx - 1].id;
-                              if (!prevId) return null;
-                              const key = segKey(prevId, st.id);
-                              return (
-                                <input
-                                  type="number"
-                                  step="1"
-                                  min="0"
-                                  value={maxSpeeds[key] ?? ""}
-                                  onChange={(e) => setMaxSpeeds((prev) => ({ ...prev, [key]: e.target.value }))}
-                                  style={{ width: 80 }}
-                                  placeholder="km/h"
-                                />
-                              );
-                            })()}
-                          </td>
-                          <td>
-                            {isSignal ? (
-                              <span style={{ color: "#848C82" }}>—</span>
-                            ) : (
-                              <input
-                                type="number"
-                                min="0"
-                                step="1"
-                                value={st.stationTracks ?? ""}
-                                onChange={(e) => updateStation(st.id, "stationTracks", e.target.value)}
-                                style={{ width: 60 }}
-                                placeholder="—"
-                              />
-                            )}
-                          </td>
-                          <td>
-                            {isSignal ? (
-                              <span style={{ color: "#848C82" }}>—</span>
-                            ) : (() => {
-                              const chain = attachStation ? [attachStation, ...bStations] : bStations;
-                              const prevId = prevRealId(chain, attachStation ? idx + 1 : idx);
-                              if (!prevId) return null;
-                              const key = segKey(prevId, st.id);
-                              return (
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="1"
-                                  value={trackCounts[key] ?? ""}
-                                  onChange={(e) => setTrackCounts((prev) => ({ ...prev, [key]: e.target.value }))}
-                                  style={{ width: 60 }}
-                                  placeholder="—"
-                                />
-                              );
-                            })()}
-                          </td>
-                          <td>
-                            {isSignal ? (
-                              <span style={{ color: "#848C82" }}>—</span>
-                            ) : (
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                value={st.dwell ?? ""}
-                                onChange={(e) => updateStation(st.id, "dwell", e.target.value)}
-                                style={{ width: 90 }}
-                                placeholder="MM:SS"
-                              />
-                            )}
-                          </td>
-                          <td>
-                            <button
-                              onClick={() => removeStation(st.id)}
-                              style={styles.iconBtn}
-                              aria-label={isSignal ? t("removeSignal") : t("removeStation")}
-                            >
-                              ✕
-                            </button>
-                          </td>
-                        </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                  </div>
-                  {(() => {
-                    const bandStations = attachStation ? [attachStation, ...bStations] : bStations;
-                    return bandStations.length > 0 ? (
-                      <div style={{ paddingTop: 25 }} title={t("routeBandTitle")}>
-                        <RouteBand stationList={bandStations} />
-                      </div>
-                    ) : null;
-                  })()}
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <button onClick={() => addStationToBranch(br.id)} style={styles.addBtn}>
-                      {t("addStationToBranch", { name: br.name })}
-                    </button>
-                    <button onClick={() => addSignalToBranch(br.id)} style={styles.addBtn} title={t("signalHint")}>
-                      {t("addSignalToBranch", { name: br.name })}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
+            {afterBranches.map(renderBranchBlock)}
             <button onClick={addBranch} style={styles.addBtn} disabled={mainStations.length === 0}>
               {t("addBranch")}
             </button>
