@@ -1,11 +1,19 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import { jsPDF } from "jspdf";
 import { autoTable } from "jspdf-autotable";
+import { auth } from "./firebase.js";
+import {
+  onAuthStateChanged,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  sendPasswordResetEmail,
+} from "firebase/auth";
 
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.7.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -203,6 +211,23 @@ const TRANSLATIONS = {
     branchDirectionBefore: "← Zulauf (davor)",
     branchDirectionToggleHint: "Richtung umschalten: Zweig danach/davor",
     removeBranch: "✕ Zweig entfernen",
+    authTitle: "Konto",
+    authEmailLabel: "E-Mail",
+    authPasswordLabel: "Passwort",
+    authSignIn: "Anmelden",
+    authSignUp: "Konto erstellen",
+    authSignOut: "Abmelden",
+    authSwitchToSignUp: "Noch kein Konto? Registrieren",
+    authSwitchToSignIn: "Schon ein Konto? Anmelden",
+    authForgotPassword: "Passwort vergessen?",
+    authLoggedInAs: "Angemeldet als {email}",
+    authResetSent: "E-Mail zum Zurücksetzen des Passworts wurde gesendet.",
+    authErrInvalidEmail: "Ungültige E-Mail-Adresse.",
+    authErrEmailInUse: "Diese E-Mail wird bereits verwendet.",
+    authErrWeakPassword: "Passwort zu schwach (mind. 6 Zeichen).",
+    authErrInvalidCredential: "E-Mail oder Passwort falsch.",
+    authErrNeedEmailForReset: "Bitte zuerst E-Mail-Adresse eingeben.",
+    cloudComingSoon: "Cloud-Speicherung von Projekten folgt im nächsten Schritt.",
     addStationToBranch: '+ Station zu "{name}" hinzufügen',
     addBranch: "+ Zweig hinzufügen",
     dwellHelp: "Haltezeit im Format MM:SS (z. B. 01:30 für 1,5 Minuten): Standardwert, falls bei einem Kurs-Halt an dieser Station nur die Ankunft (manuell oder automatisch berechnet) angegeben ist, aber keine Abfahrt und keine eigene Haltezeit beim jeweiligen Halt im Kurs hinterlegt wurde. Leer entspricht dem bisherigen Verhalten (Abfahrt = Ankunft).",
@@ -380,6 +405,23 @@ const TRANSLATIONS = {
     branchDirectionBefore: "← Feeder (before)",
     branchDirectionToggleHint: "Switch direction: branch after/before main",
     removeBranch: "✕ Remove branch",
+    authTitle: "Account",
+    authEmailLabel: "Email",
+    authPasswordLabel: "Password",
+    authSignIn: "Sign in",
+    authSignUp: "Create account",
+    authSignOut: "Sign out",
+    authSwitchToSignUp: "No account yet? Sign up",
+    authSwitchToSignIn: "Already have an account? Sign in",
+    authForgotPassword: "Forgot password?",
+    authLoggedInAs: "Signed in as {email}",
+    authResetSent: "Password reset email sent.",
+    authErrInvalidEmail: "Invalid email address.",
+    authErrEmailInUse: "This email is already in use.",
+    authErrWeakPassword: "Password too weak (min. 6 characters).",
+    authErrInvalidCredential: "Wrong email or password.",
+    authErrNeedEmailForReset: "Please enter your email address first.",
+    cloudComingSoon: "Cloud project storage is coming in the next step.",
     addStationToBranch: '+ Add station to "{name}"',
     addBranch: "+ Add branch",
     dwellHelp: "Dwell time in MM:SS format (e.g. 01:30 for 1.5 minutes): default value used when a service stop at this station only has an arrival (manual or auto-calculated) but no departure and no dwell time of its own set at that stop. Leave empty for the previous behavior (departure = arrival).",
@@ -504,6 +546,20 @@ export default function GraphicalTimetable() {
   const [exportGenerating, setExportGenerating] = useState(false);
   const [lang, setLang] = useState("de");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState("signin"); // "signin" | "signup"
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setAuthUser(u);
+      setAuthLoading(false);
+    });
+    return unsub;
+  }, []);
   function t(key, vars) {
     let str = (TRANSLATIONS[lang] && TRANSLATIONS[lang][key]) || TRANSLATIONS.de[key] || key;
     if (vars) {
@@ -2513,6 +2569,52 @@ export default function GraphicalTimetable() {
     }
   }
 
+  function authErrorMessage(err) {
+    const code = err && err.code;
+    if (code === "auth/invalid-email") return t("authErrInvalidEmail");
+    if (code === "auth/email-already-in-use") return t("authErrEmailInUse");
+    if (code === "auth/weak-password") return t("authErrWeakPassword");
+    if (code === "auth/invalid-credential" || code === "auth/wrong-password" || code === "auth/user-not-found")
+      return t("authErrInvalidCredential");
+    return (err && err.message) || String(err);
+  }
+  async function handleAuthSubmit(e) {
+    e.preventDefault();
+    setAuthError("");
+    setAuthBusy(true);
+    try {
+      if (authMode === "signup") {
+        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+      } else {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      }
+      setAuthPassword("");
+    } catch (err) {
+      setAuthError(authErrorMessage(err));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+  async function handleSignOut() {
+    await signOut(auth);
+  }
+  async function handlePasswordReset() {
+    setAuthError("");
+    if (!authEmail) {
+      setAuthError(t("authErrNeedEmailForReset"));
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      await sendPasswordResetEmail(auth, authEmail);
+      setAuthError(t("authResetSent"));
+    } catch (err) {
+      setAuthError(authErrorMessage(err));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
   function handleLoadFile(e) {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
@@ -4503,6 +4605,57 @@ export default function GraphicalTimetable() {
 
       {tab === "save" && (
         <div style={styles.panel}>
+          <div style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid #D7DBD5" }}>
+            <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("authTitle")}</p>
+            {authLoading ? null : authUser ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ fontSize: 13 }}>{t("authLoggedInAs", { email: authUser.email })}</span>
+                <button onClick={handleSignOut} style={styles.addBtn}>{t("authSignOut")}</button>
+              </div>
+            ) : (
+              <form onSubmit={handleAuthSubmit} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 280 }}>
+                <input
+                  type="email"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  placeholder={t("authEmailLabel")}
+                  autoComplete="email"
+                  required
+                />
+                <input
+                  type="password"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder={t("authPasswordLabel")}
+                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                  required
+                  minLength={6}
+                />
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <button type="submit" style={styles.addBtn} disabled={authBusy}>
+                    {authMode === "signup" ? t("authSignUp") : t("authSignIn")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setAuthMode((m) => (m === "signup" ? "signin" : "signup")); setAuthError(""); }}
+                    style={styles.ghostBtn}
+                  >
+                    {authMode === "signup" ? t("authSwitchToSignIn") : t("authSwitchToSignUp")}
+                  </button>
+                </div>
+                {authMode === "signin" && (
+                  <button type="button" onClick={handlePasswordReset} style={{ ...styles.ghostBtn, alignSelf: "flex-start" }}>
+                    {t("authForgotPassword")}
+                  </button>
+                )}
+                {authError && <p style={{ fontSize: 12, color: "#B3261E", margin: 0 }}>{authError}</p>}
+              </form>
+            )}
+            {authUser && (
+              <p style={{ fontSize: 12, color: "#848C82", marginTop: 10 }}>{t("cloudComingSoon")}</p>
+            )}
+          </div>
+
           <label style={{ ...styles.intervalLabel, marginBottom: 14 }}>
             {t("scenarioName")}
             <input
