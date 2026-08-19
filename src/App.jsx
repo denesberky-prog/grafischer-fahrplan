@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import { jsPDF } from "jspdf";
 import { autoTable } from "jspdf-autotable";
-import { auth } from "./firebase.js";
+import { auth, db } from "./firebase.js";
 import {
   onAuthStateChanged,
   createUserWithEmailAndPassword,
@@ -9,11 +9,22 @@ import {
   signOut,
   sendPasswordResetEmail,
 } from "firebase/auth";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  addDoc,
+  setDoc,
+  query,
+  orderBy,
+  serverTimestamp,
+} from "firebase/firestore";
 
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.7.0";
+const APP_VERSION = "1.8.0";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -135,10 +146,12 @@ const TRANSLATIONS = {
     tabCsv: "CSV-Import",
     tabSave: "Speichern/Laden",
     tabVehicles: "Fahrzeuge",
+    tabAccount: "Konto",
     collapseSidebar: "Navigation einklappen",
     expandSidebar: "Navigation ausklappen",
     groupData: "Daten",
     groupFile: "Datei",
+    groupAccount: "Konto",
     emptyTitle: "Noch kein Szenario geladen.",
     emptyDesc: 'Lade unter "Speichern/Laden" ein zuvor gespeichertes Szenario (.json) oder lege im Tab "Stationen" und "Kurse" eines von Hand an.',
     emptyButton: 'Zu "Speichern/Laden"',
@@ -227,7 +240,20 @@ const TRANSLATIONS = {
     authErrWeakPassword: "Passwort zu schwach (mind. 6 Zeichen).",
     authErrInvalidCredential: "E-Mail oder Passwort falsch.",
     authErrNeedEmailForReset: "Bitte zuerst E-Mail-Adresse eingeben.",
-    cloudComingSoon: "Cloud-Speicherung von Projekten folgt im nächsten Schritt.",
+    cloudProjectsTitle: "Cloud-Projekte",
+    cloudProjectPick: "— Projekt wählen —",
+    cloudPreviewUpdated: "Zuletzt bearbeitet",
+    cloudPreviewStations: "{n} Stationen",
+    cloudPreviewKurse: "{n} Kurse",
+    cloudLoadBtn: "Laden",
+    cloudSaveBtn: "In Cloud speichern",
+    cloudSaveAsNewBtn: "Als neues Projekt speichern",
+    cloudLoggedOutHint: "Melde dich an, um Projekte in der Cloud zu speichern.",
+    cloudNoProjects: "Noch keine Cloud-Projekte gespeichert.",
+    cloudSaved: "In der Cloud gespeichert.",
+    cloudErrGeneric: "Fehler: {msg}",
+    cloudErrNotFound: "Projekt nicht gefunden.",
+    cloudCurrentBadge: "aktuell geladen",
     addStationToBranch: '+ Station zu "{name}" hinzufügen',
     addBranch: "+ Zweig hinzufügen",
     dwellHelp: "Haltezeit im Format MM:SS (z. B. 01:30 für 1,5 Minuten): Standardwert, falls bei einem Kurs-Halt an dieser Station nur die Ankunft (manuell oder automatisch berechnet) angegeben ist, aber keine Abfahrt und keine eigene Haltezeit beim jeweiligen Halt im Kurs hinterlegt wurde. Leer entspricht dem bisherigen Verhalten (Abfahrt = Ankunft).",
@@ -329,10 +355,12 @@ const TRANSLATIONS = {
     tabCsv: "CSV import",
     tabSave: "Save/Load",
     tabVehicles: "Vehicles",
+    tabAccount: "Account",
     collapseSidebar: "Collapse navigation",
     expandSidebar: "Expand navigation",
     groupData: "Data",
     groupFile: "File",
+    groupAccount: "Account",
     emptyTitle: "No scenario loaded yet.",
     emptyDesc: 'Load a previously saved scenario (.json) under "Save/Load", or create one by hand in the "Stations" and "Services" tabs.',
     emptyButton: 'Go to "Save/Load"',
@@ -421,7 +449,20 @@ const TRANSLATIONS = {
     authErrWeakPassword: "Password too weak (min. 6 characters).",
     authErrInvalidCredential: "Wrong email or password.",
     authErrNeedEmailForReset: "Please enter your email address first.",
-    cloudComingSoon: "Cloud project storage is coming in the next step.",
+    cloudProjectsTitle: "Cloud projects",
+    cloudProjectPick: "— Select a project —",
+    cloudPreviewUpdated: "Last edited",
+    cloudPreviewStations: "{n} stations",
+    cloudPreviewKurse: "{n} services",
+    cloudLoadBtn: "Load",
+    cloudSaveBtn: "Save to cloud",
+    cloudSaveAsNewBtn: "Save as new project",
+    cloudLoggedOutHint: "Sign in to save projects to the cloud.",
+    cloudNoProjects: "No cloud projects saved yet.",
+    cloudSaved: "Saved to the cloud.",
+    cloudErrGeneric: "Error: {msg}",
+    cloudErrNotFound: "Project not found.",
+    cloudCurrentBadge: "currently loaded",
     addStationToBranch: '+ Add station to "{name}"',
     addBranch: "+ Add branch",
     dwellHelp: "Dwell time in MM:SS format (e.g. 01:30 for 1.5 minutes): default value used when a service stop at this station only has an arrival (manual or auto-calculated) but no departure and no dwell time of its own set at that stop. Leave empty for the previous behavior (departure = arrival).",
@@ -553,6 +594,13 @@ export default function GraphicalTimetable() {
   const [authPassword, setAuthPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  const [cloudProjects, setCloudProjects] = useState([]);
+  const [cloudProjectsLoading, setCloudProjectsLoading] = useState(false);
+  const [selectedCloudProjectId, setSelectedCloudProjectId] = useState("");
+  const [currentCloudProjectId, setCurrentCloudProjectId] = useState(null);
+  const [cloudMsg, setCloudMsg] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const autoLoadedUidRef = useRef(null);
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setAuthUser(u);
@@ -2487,8 +2535,10 @@ export default function GraphicalTimetable() {
     );
   }
 
-  function exportScenario() {
-    const data = {
+  // The full scenario as plain data — shared by local JSON export and cloud (Firestore) save,
+  // so both write/read exactly the same shape.
+  function scenarioData() {
+    return {
       type: "grafischer-fahrplan-szenario",
       version: 4,
       name: scenarioName || "Fahrplan",
@@ -2502,6 +2552,9 @@ export default function GraphicalTimetable() {
       maxSpeeds,
       trackCounts,
     };
+  }
+  function exportScenario() {
+    const data = scenarioData();
     const name = safeFileName();
     downloadFile(JSON.stringify(data, null, 2), `${name}.json`, "application/json");
     setSaveMsg(t("msgSavedAs", { name }));
@@ -2545,29 +2598,131 @@ export default function GraphicalTimetable() {
     setSaveMsg(t("msgStationsSaved", { name }));
   }
 
+  // Applies a parsed scenario object (from a local .json file or a Firestore project doc) to
+  // app state. Returns true on success, false if the shape is invalid.
+  function applyScenarioData(data) {
+    if (!data || !Array.isArray(data.stations) || !Array.isArray(data.kurse)) return false;
+    setStations(data.stations);
+    setBranches(Array.isArray(data.branches) ? data.branches : []);
+    setKurse(data.kurse);
+    setVehicles(Array.isArray(data.vehicles) && data.vehicles.length ? data.vehicles : initialVehicles);
+    if (data.yMode) setYMode(data.yMode);
+    if (data.winStart) setWinStart(data.winStart);
+    if (data.winEnd) setWinEnd(data.winEnd);
+    if (data.name) setScenarioName(data.name);
+    setMaxSpeeds(data.maxSpeeds && typeof data.maxSpeeds === "object" ? data.maxSpeeds : {});
+    setTrackCounts(data.trackCounts && typeof data.trackCounts === "object" ? data.trackCounts : {});
+    setVisible(Object.fromEntries(data.kurse.map((k) => [k.id, true])));
+    return true;
+  }
   function loadScenarioFromText(text) {
     try {
       const data = JSON.parse(text);
-      if (!data || !Array.isArray(data.stations) || !Array.isArray(data.kurse)) {
+      if (!applyScenarioData(data)) {
         setSaveMsg(t("msgInvalidScenario"));
         return;
       }
-      setStations(data.stations);
-      setBranches(Array.isArray(data.branches) ? data.branches : []);
-      setKurse(data.kurse);
-      setVehicles(Array.isArray(data.vehicles) && data.vehicles.length ? data.vehicles : initialVehicles);
-      if (data.yMode) setYMode(data.yMode);
-      if (data.winStart) setWinStart(data.winStart);
-      if (data.winEnd) setWinEnd(data.winEnd);
-      if (data.name) setScenarioName(data.name);
-      setMaxSpeeds(data.maxSpeeds && typeof data.maxSpeeds === "object" ? data.maxSpeeds : {});
-      setTrackCounts(data.trackCounts && typeof data.trackCounts === "object" ? data.trackCounts : {});
-      setVisible(Object.fromEntries(data.kurse.map((k) => [k.id, true])));
       setSaveMsg(t("msgLoaded", { name: data.name || t("defaultScenarioName") }));
     } catch (err) {
       setSaveMsg(t("msgLoadFailed"));
     }
   }
+
+  // --- Cloud projects (Firestore, per-user) ---
+  function cloudProjectsCollection(uid) {
+    return collection(db, "users", uid, "projects");
+  }
+  async function fetchCloudProjects() {
+    if (!authUser) return [];
+    setCloudProjectsLoading(true);
+    try {
+      const q = query(cloudProjectsCollection(authUser.uid), orderBy("updatedAt", "desc"));
+      const snap = await getDocs(q);
+      const list = snap.docs.map((d) => {
+        const v = d.data();
+        const inner = v.data || {};
+        return {
+          id: d.id,
+          name: v.name || t("defaultScenarioName"),
+          updatedAt: v.updatedAt && v.updatedAt.toDate ? v.updatedAt.toDate() : null,
+          stationCount: Array.isArray(inner.stations) ? inner.stations.length : 0,
+          kursCount: Array.isArray(inner.kurse) ? inner.kurse.length : 0,
+        };
+      });
+      setCloudProjects(list);
+      return list;
+    } catch (err) {
+      setCloudMsg(t("cloudErrGeneric", { msg: err.message || String(err) }));
+      return [];
+    } finally {
+      setCloudProjectsLoading(false);
+    }
+  }
+  async function loadCloudProject(id) {
+    if (!authUser || !id) return;
+    setCloudBusy(true);
+    setCloudMsg("");
+    try {
+      const snap = await getDoc(doc(db, "users", authUser.uid, "projects", id));
+      if (!snap.exists()) {
+        setCloudMsg(t("cloudErrNotFound"));
+        return;
+      }
+      const v = snap.data();
+      applyScenarioData(v.data);
+      setScenarioName(v.name || t("defaultScenarioName"));
+      setCurrentCloudProjectId(id);
+      setSelectedCloudProjectId(id);
+      setSaveMsg(t("msgLoaded", { name: v.name || t("defaultScenarioName") }));
+    } catch (err) {
+      setCloudMsg(t("cloudErrGeneric", { msg: err.message || String(err) }));
+    } finally {
+      setCloudBusy(false);
+    }
+  }
+  async function saveCloudProject(asNew) {
+    if (!authUser) return;
+    setCloudBusy(true);
+    setCloudMsg("");
+    try {
+      const payload = {
+        name: scenarioName || t("defaultScenarioName"),
+        data: scenarioData(),
+        updatedAt: serverTimestamp(),
+      };
+      if (currentCloudProjectId && !asNew) {
+        await setDoc(doc(db, "users", authUser.uid, "projects", currentCloudProjectId), payload);
+      } else {
+        const ref = await addDoc(cloudProjectsCollection(authUser.uid), payload);
+        setCurrentCloudProjectId(ref.id);
+        setSelectedCloudProjectId(ref.id);
+      }
+      setCloudMsg(t("cloudSaved"));
+      fetchCloudProjects();
+    } catch (err) {
+      setCloudMsg(t("cloudErrGeneric", { msg: err.message || String(err) }));
+    } finally {
+      setCloudBusy(false);
+    }
+  }
+  // On sign-in, load the most recently edited cloud project automatically (once per session).
+  useEffect(() => {
+    if (authUser) {
+      if (autoLoadedUidRef.current !== authUser.uid) {
+        autoLoadedUidRef.current = authUser.uid;
+        (async () => {
+          const list = await fetchCloudProjects();
+          if (list.length) await loadCloudProject(list[0].id);
+        })();
+      }
+    } else {
+      autoLoadedUidRef.current = null;
+      setCloudProjects([]);
+      setCurrentCloudProjectId(null);
+      setSelectedCloudProjectId("");
+      setCloudMsg("");
+    }
+  }, [authUser]);
 
   function authErrorMessage(err) {
     const code = err && err.code;
@@ -2764,6 +2919,12 @@ export default function GraphicalTimetable() {
       )}
     </svg>
   );
+  const IconAccount = () => (
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+      <circle cx="8" cy="5.5" r="2.7" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M2.5 13.5 C2.5 10.5 5 9 8 9 C11 9 13.5 10.5 13.5 13.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
 
   const navMain = [
     { key: "diagram", label: t("tabDiagram"), Icon: IconDiagram },
@@ -2777,6 +2938,9 @@ export default function GraphicalTimetable() {
   const navFile = [
     { key: "csv", label: t("tabCsv"), Icon: IconImport },
     { key: "save", label: t("tabSave"), Icon: IconSave },
+  ];
+  const navAccount = [
+    { key: "account", label: t("tabAccount"), Icon: IconAccount },
   ];
   function renderNavItem({ key, label, Icon }) {
     const active = tab === key;
@@ -3195,6 +3359,11 @@ export default function GraphicalTimetable() {
           <div style={styles.navGroup}>
             {!sidebarCollapsed && <div style={styles.navGroupLabel}>{t("groupFile")}</div>}
             {navFile.map(renderNavItem)}
+          </div>
+
+          <div style={styles.navGroup}>
+            {!sidebarCollapsed && <div style={styles.navGroupLabel}>{t("groupAccount")}</div>}
+            {navAccount.map(renderNavItem)}
           </div>
 
           <div style={styles.sidebarFooter}>
@@ -4603,56 +4772,116 @@ export default function GraphicalTimetable() {
         </div>
       )}
 
+      {tab === "account" && (
+        <div style={styles.panel}>
+          <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("authTitle")}</p>
+          {authLoading ? null : authUser ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 13 }}>{t("authLoggedInAs", { email: authUser.email })}</span>
+              <button onClick={handleSignOut} style={styles.addBtn}>{t("authSignOut")}</button>
+            </div>
+          ) : (
+            <form onSubmit={handleAuthSubmit} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 280 }}>
+              <input
+                type="email"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                placeholder={t("authEmailLabel")}
+                autoComplete="email"
+                required
+              />
+              <input
+                type="password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                placeholder={t("authPasswordLabel")}
+                autoComplete={authMode === "signup" ? "new-password" : "current-password"}
+                required
+                minLength={6}
+              />
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button type="submit" style={styles.addBtn} disabled={authBusy}>
+                  {authMode === "signup" ? t("authSignUp") : t("authSignIn")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAuthMode((m) => (m === "signup" ? "signin" : "signup")); setAuthError(""); }}
+                  style={styles.ghostBtn}
+                >
+                  {authMode === "signup" ? t("authSwitchToSignIn") : t("authSwitchToSignUp")}
+                </button>
+              </div>
+              {authMode === "signin" && (
+                <button type="button" onClick={handlePasswordReset} style={{ ...styles.ghostBtn, alignSelf: "flex-start" }}>
+                  {t("authForgotPassword")}
+                </button>
+              )}
+              {authError && <p style={{ fontSize: 12, color: "#B3261E", margin: 0 }}>{authError}</p>}
+            </form>
+          )}
+        </div>
+      )}
+
       {tab === "save" && (
         <div style={styles.panel}>
           <div style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid #D7DBD5" }}>
-            <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("authTitle")}</p>
-            {authLoading ? null : authUser ? (
-              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <span style={{ fontSize: 13 }}>{t("authLoggedInAs", { email: authUser.email })}</span>
-                <button onClick={handleSignOut} style={styles.addBtn}>{t("authSignOut")}</button>
-              </div>
+            <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("cloudProjectsTitle")}</p>
+            {!authUser ? (
+              <p style={{ fontSize: 13, color: "#848C82" }}>{t("cloudLoggedOutHint")}</p>
             ) : (
-              <form onSubmit={handleAuthSubmit} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 280 }}>
-                <input
-                  type="email"
-                  value={authEmail}
-                  onChange={(e) => setAuthEmail(e.target.value)}
-                  placeholder={t("authEmailLabel")}
-                  autoComplete="email"
-                  required
-                />
-                <input
-                  type="password"
-                  value={authPassword}
-                  onChange={(e) => setAuthPassword(e.target.value)}
-                  placeholder={t("authPasswordLabel")}
-                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
-                  required
-                  minLength={6}
-                />
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <button type="submit" style={styles.addBtn} disabled={authBusy}>
-                    {authMode === "signup" ? t("authSignUp") : t("authSignIn")}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setAuthMode((m) => (m === "signup" ? "signin" : "signup")); setAuthError(""); }}
-                    style={styles.ghostBtn}
-                  >
-                    {authMode === "signup" ? t("authSwitchToSignIn") : t("authSwitchToSignUp")}
-                  </button>
-                </div>
-                {authMode === "signin" && (
-                  <button type="button" onClick={handlePasswordReset} style={{ ...styles.ghostBtn, alignSelf: "flex-start" }}>
-                    {t("authForgotPassword")}
-                  </button>
+              <>
+                {cloudProjectsLoading ? (
+                  <p style={{ fontSize: 13, color: "#848C82" }}>…</p>
+                ) : cloudProjects.length === 0 ? (
+                  <p style={{ fontSize: 13, color: "#848C82" }}>{t("cloudNoProjects")}</p>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, maxWidth: 420 }}>
+                    <select
+                      value={selectedCloudProjectId}
+                      onChange={(e) => setSelectedCloudProjectId(e.target.value)}
+                    >
+                      <option value="">{t("cloudProjectPick")}</option>
+                      {cloudProjects.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                          {p.updatedAt ? ` · ${formatBuildTime(p.updatedAt.toISOString())}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {(() => {
+                      const p = cloudProjects.find((p) => p.id === selectedCloudProjectId);
+                      if (!p) return null;
+                      return (
+                        <div style={{ fontSize: 12, color: "#5C6570", display: "flex", flexDirection: "column", gap: 2 }}>
+                          {p.id === currentCloudProjectId && (
+                            <span style={{ color: "#9C7A2E", fontWeight: 500 }}>{t("cloudCurrentBadge")}</span>
+                          )}
+                          <span>{t("cloudPreviewStations", { n: p.stationCount })} · {t("cloudPreviewKurse", { n: p.kursCount })}</span>
+                          {p.updatedAt && <span>{t("cloudPreviewUpdated")}: {formatBuildTime(p.updatedAt.toISOString())}</span>}
+                          <button
+                            onClick={() => loadCloudProject(p.id)}
+                            style={{ ...styles.addBtn, alignSelf: "flex-start", marginTop: 4 }}
+                            disabled={cloudBusy}
+                          >
+                            {t("cloudLoadBtn")}
+                          </button>
+                        </div>
+                      );
+                    })()}
+                  </div>
                 )}
-                {authError && <p style={{ fontSize: 12, color: "#B3261E", margin: 0 }}>{authError}</p>}
-              </form>
-            )}
-            {authUser && (
-              <p style={{ fontSize: 12, color: "#848C82", marginTop: 10 }}>{t("cloudComingSoon")}</p>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                  <button onClick={() => saveCloudProject(false)} style={styles.addBtn} disabled={cloudBusy}>
+                    {t("cloudSaveBtn")}
+                  </button>
+                  {currentCloudProjectId && (
+                    <button onClick={() => saveCloudProject(true)} style={styles.ghostBtn} disabled={cloudBusy}>
+                      {t("cloudSaveAsNewBtn")}
+                    </button>
+                  )}
+                </div>
+                {cloudMsg && <p style={{ fontSize: 13, color: "#171B1F", marginTop: 8 }}>{cloudMsg}</p>}
+              </>
             )}
           </div>
 
