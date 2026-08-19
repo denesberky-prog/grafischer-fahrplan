@@ -24,7 +24,7 @@ import {
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.8.1";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -308,6 +308,8 @@ const TRANSLATIONS = {
     saveDesc: "Zwei Formate zur Wahl: {json} speichert alles (Stationen, Kurse, Zeitfenster, Achsen-Modus) in einer Datei und eignet sich am besten, um ein Szenario 1:1 wiederherzustellen. {csv} speichert Kurse bzw. Stationen als Tabelle – bearbeitbar in Excel und über den CSV-Import-Tab direkt wieder einlesbar. Beides landet im Download-Ordner deines Browsers; leg dir dafür am besten einen eigenen Ordner an, in den du die Dateien verschiebst.",
     scenarioName: "Szenarioname",
     scenarioNamePlaceholder: "z. B. Nachtbetrieb",
+    scenarioBadgePrefix: "Szenario",
+    lastSavedLabel: "zuletzt gespeichert",
     jsonFull: "JSON (vollständig)",
     saveScenario: "Szenario speichern (.json)",
     csvForExcel: "CSV (für Excel)",
@@ -517,6 +519,8 @@ const TRANSLATIONS = {
     saveDesc: "Two formats to choose from: {json} saves everything (stations, services, time window, axis mode) in one file and is best for restoring a scenario exactly. {csv} saves services or stations as a table – editable in Excel and can be read back in directly via the CSV import tab. Both land in your browser's downloads folder; it's best to create your own folder to move the files into.",
     scenarioName: "Scenario name",
     scenarioNamePlaceholder: "e.g. night service",
+    scenarioBadgePrefix: "Scenario",
+    lastSavedLabel: "last saved",
     jsonFull: "JSON (complete)",
     saveScenario: "Save scenario (.json)",
     csvForExcel: "CSV (for Excel)",
@@ -600,6 +604,7 @@ export default function GraphicalTimetable() {
   const [currentCloudProjectId, setCurrentCloudProjectId] = useState(null);
   const [cloudMsg, setCloudMsg] = useState("");
   const [cloudBusy, setCloudBusy] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState(null);
   const autoLoadedUidRef = useRef(null);
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
@@ -2673,6 +2678,7 @@ export default function GraphicalTimetable() {
       setScenarioName(v.name || t("defaultScenarioName"));
       setCurrentCloudProjectId(id);
       setSelectedCloudProjectId(id);
+      setLastSavedAt(v.updatedAt && v.updatedAt.toDate ? v.updatedAt.toDate() : null);
       setSaveMsg(t("msgLoaded", { name: v.name || t("defaultScenarioName") }));
     } catch (err) {
       setCloudMsg(t("cloudErrGeneric", { msg: err.message || String(err) }));
@@ -2697,6 +2703,7 @@ export default function GraphicalTimetable() {
         setCurrentCloudProjectId(ref.id);
         setSelectedCloudProjectId(ref.id);
       }
+      setLastSavedAt(new Date());
       setCloudMsg(t("cloudSaved"));
       fetchCloudProjects();
     } catch (err) {
@@ -3348,6 +3355,19 @@ export default function GraphicalTimetable() {
               <IconCollapse collapsed={sidebarCollapsed} />
             </button>
           </div>
+
+          {!sidebarCollapsed && scenarioName && (
+            <div style={styles.scenarioBadge}>
+              <div style={styles.scenarioBadgeName} title={scenarioName}>
+                {t("scenarioBadgePrefix")}: {scenarioName}
+              </div>
+              {lastSavedAt && (
+                <div style={styles.scenarioBadgeMeta}>
+                  {t("lastSavedLabel")}: {formatBuildTime(lastSavedAt.toISOString())}
+                </div>
+              )}
+            </div>
+          )}
 
           <div style={styles.navGroup}>{navMain.map(renderNavItem)}</div>
 
@@ -4824,6 +4844,25 @@ export default function GraphicalTimetable() {
 
       {tab === "save" && (
         <div style={styles.panel}>
+          <div style={styles.scenarioNameCard}>
+            <label style={styles.scenarioNameCardLabel} htmlFor="scenario-name-input">
+              {t("scenarioName")}
+            </label>
+            <input
+              id="scenario-name-input"
+              type="text"
+              value={scenarioName}
+              onChange={(e) => setScenarioName(e.target.value)}
+              style={styles.scenarioNameCardInput}
+              placeholder={t("scenarioNamePlaceholder")}
+            />
+            {lastSavedAt && (
+              <div style={styles.scenarioNameCardMeta}>
+                {t("lastSavedLabel")}: {formatBuildTime(lastSavedAt.toISOString())}
+              </div>
+            )}
+          </div>
+
           <div style={{ marginBottom: 24, paddingBottom: 20, borderBottom: "1px solid #D7DBD5" }}>
             <p style={{ fontSize: 13, fontWeight: 500, margin: "0 0 8px" }}>{t("cloudProjectsTitle")}</p>
             {!authUser ? (
@@ -4884,17 +4923,6 @@ export default function GraphicalTimetable() {
               </>
             )}
           </div>
-
-          <label style={{ ...styles.intervalLabel, marginBottom: 14 }}>
-            {t("scenarioName")}
-            <input
-              type="text"
-              value={scenarioName}
-              onChange={(e) => setScenarioName(e.target.value)}
-              style={{ width: 220 }}
-              placeholder={t("scenarioNamePlaceholder")}
-            />
-          </label>
 
           <div style={{ marginBottom: 20 }}>
             <p style={{ fontSize: 12, color: "#848C82", margin: "0 0 6px", fontWeight: 500 }}>{t("jsonFull")}</p>
@@ -4982,6 +5010,54 @@ const styles = {
     alignItems: "center",
     justifyContent: "center",
     padding: 4,
+  },
+  scenarioNameCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    background: "#FBF7ED",
+    border: "1px solid #E3D6B0",
+    borderRadius: 8,
+    padding: "14px 16px",
+    marginBottom: 24,
+  },
+  scenarioNameCardLabel: {
+    fontSize: 11,
+    fontWeight: 600,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    color: "#9C7A2E",
+  },
+  scenarioNameCardInput: {
+    fontSize: 18,
+    fontWeight: 600,
+    padding: "8px 10px",
+    width: "100%",
+    maxWidth: 360,
+  },
+  scenarioNameCardMeta: {
+    fontSize: 12,
+    color: "#848C82",
+  },
+  scenarioBadge: {
+    padding: "8px 10px",
+    marginBottom: 10,
+    background: "#FBF7ED",
+    border: "1px solid #E3D6B0",
+    borderRadius: 6,
+  },
+  scenarioBadgeName: {
+    fontSize: 12.5,
+    fontWeight: 600,
+    color: "#171B1F",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  scenarioBadgeMeta: {
+    fontSize: 10.5,
+    color: "#9C7A2E",
+    marginTop: 2,
   },
   navGroup: {
     display: "flex",
