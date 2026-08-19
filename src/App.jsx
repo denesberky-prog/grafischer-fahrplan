@@ -5,7 +5,7 @@ import { autoTable } from "jspdf-autotable";
 // Bump manually for each meaningful change; shown in the sidebar footer. BUILD_TIME is
 // injected by build.mjs (esbuild `define`) at build time — always the actual build moment,
 // never edited by hand.
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.5.1";
 const BUILD_TIME = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : null;
 
 function formatBuildTime(iso) {
@@ -1620,8 +1620,15 @@ export default function GraphicalTimetable() {
   // printed timetables fix this by splitting the overtaken train's column at that station: the
   // arrival stays in A's original column, and a new column carrying A's departure and everything
   // after is spliced in immediately right of B. Runs top-to-bottom once, re-scanning each row
-  // after every split since column positions shift (so a train overtaken twice gets a third
-  // segment automatically).
+  // after every split since column positions shift (so a train overtaken twice — at two
+  // different stations — gets a third segment automatically).
+  //
+  // When more than one train overtakes A at the very same station, A must jump past all of them
+  // in one move: finding only the nearest (adjacent) one and splitting repeatedly would relocate
+  // A one step at a time, and each intermediate stop re-triggers a further split — leaving an
+  // empty vestigial column behind at the first stopping point. So for the column being split, we
+  // look for the *last* (rightmost) present column it's still out of order with, and insert its
+  // "after" segment directly there.
   function splitOvertakes(columns, flatRows) {
     let order = columns.map((c) => ({ ...c }));
     for (const row of flatRows) {
@@ -1636,13 +1643,18 @@ export default function GraphicalTimetable() {
             present.push({ idx, t: cell.dep !== null ? cell.dep : cell.arr });
           }
         });
-        for (let i = 1; i < present.length; i++) {
-          const beforeIdx = present[i - 1].idx;
-          const overtakingIdx = present[i].idx;
-          if (present[i].t >= present[i - 1].t) continue;
+        for (let i = 0; i < present.length; i++) {
+          let lastFaster = -1;
+          for (let j = i + 1; j < present.length; j++) {
+            if (present[j].t < present[i].t) lastFaster = j;
+          }
+          if (lastFaster === -1) continue; // not overtaken by anyone (left) at this row
+
+          const beforeIdx = present[i].idx;
+          const insertAfterIdx = present[lastFaster].idx;
           const beforeCol = order[beforeIdx];
           const beforeCell = beforeCol.cells[rk];
-          if (beforeCell.dep === null) continue; // terminates here — nothing to carry into a split
+          if (beforeCell.dep === null) break; // terminates here — nothing to carry into a split
 
           const afterCells = {};
           const newBeforeCells = {};
@@ -1658,7 +1670,7 @@ export default function GraphicalTimetable() {
             afterCells[r2.rowKey] = reachedSplit ? beforeCol.cells[r2.rowKey] : { kind: "blank" };
           }
           order[beforeIdx] = { ...beforeCol, cells: newBeforeCells };
-          order.splice(overtakingIdx + 1, 0, {
+          order.splice(insertAfterIdx + 1, 0, {
             ...beforeCol,
             tripId: `${beforeCol.tripId}~split${rk}`,
             cells: afterCells,
